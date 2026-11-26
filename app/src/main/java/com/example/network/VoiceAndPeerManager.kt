@@ -368,14 +368,35 @@ class BouChorLanManager(private val listener: PeerEventsListener) {
                 put("roomCode", currentRoomCode)
             }.toString()
             out.println(hello)
-            s
+
+            s.soTimeout = 800
+            val reader = BufferedReader(InputStreamReader(s.getInputStream()))
+            val respLine = reader.readLine() ?: return@withContext null
+            val obj = JSONObject(respLine)
+            val respType = obj.optString("type")
+            val respCode = obj.optString("roomCode")
+
+            if (respType == "hello_reply" && (currentRoomCode.contains(".") || respCode.equals(currentRoomCode, ignoreCase = true))) {
+                val hostName = obj.optString("name", "Host")
+                listener.onRemotePeerJoined("lan_host", hostName)
+                s.soTimeout = 0
+                s
+            } else {
+                try { s.close() } catch (_: Throwable) {}
+                null
+            }
         } catch (_: Throwable) {
             null
         }
     }
 
     private fun getLocalSubnetPrefixes(): List<String> {
-        val prefixes = mutableListOf<String>()
+        val prefixes = mutableSetOf<String>()
+        prefixes.add("192.168.1.")
+        prefixes.add("192.168.0.")
+        prefixes.add("192.168.43.")
+        prefixes.add("10.0.2.")
+        prefixes.add("172.20.10.")
         try {
             val interfaces = NetworkInterface.getNetworkInterfaces()
             while (interfaces.hasMoreElements()) {
@@ -389,13 +410,13 @@ class BouChorLanManager(private val listener: PeerEventsListener) {
                         val lastDot = host.lastIndexOf('.')
                         if (lastDot > 0) {
                             val prefix = host.substring(0, lastDot + 1)
-                            if (!prefixes.contains(prefix)) prefixes.add(prefix)
+                            prefixes.add(prefix)
                         }
                     }
                 }
             }
         } catch (_: Throwable) {}
-        return prefixes
+        return prefixes.toList()
     }
 
     private suspend fun handleClientSession(socket: Socket) {
@@ -481,6 +502,27 @@ class BouChorLanManager(private val listener: PeerEventsListener) {
             hostClientSockets.clear()
         }
     }
+}
+
+fun getPrimaryLocalIpAddress(): String {
+    try {
+        val interfaces = NetworkInterface.getNetworkInterfaces()
+        while (interfaces.hasMoreElements()) {
+            val netIf = interfaces.nextElement()
+            if (netIf.isLoopback || !netIf.isUp) continue
+            val addrs = netIf.inetAddresses
+            while (addrs.hasMoreElements()) {
+                val addr = addrs.nextElement()
+                if (!addr.isLoopbackAddress && addr is Inet4Address) {
+                    val host = addr.hostAddress ?: continue
+                    if (host.isNotEmpty() && !host.startsWith("127.")) {
+                        return host
+                    }
+                }
+            }
+        }
+    } catch (_: Throwable) {}
+    return "127.0.0.1"
 }
 
 /**

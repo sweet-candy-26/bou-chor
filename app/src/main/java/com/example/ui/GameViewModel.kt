@@ -24,6 +24,7 @@ import com.example.game.WeatherType
 import com.example.network.NativeMicMonitor
 import com.example.network.PeerBridgeController
 import com.example.network.PeerEventsListener
+import com.example.network.getPrimaryLocalIpAddress
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -52,6 +53,7 @@ data class BouChorUiState(
     val isTeamRadioEnabled: Boolean = false,
     val micPermissionGranted: Boolean = false,
     val localMicLevel: Float = 0f,
+    val hostIpAddress: String? = null,
     val peerStatusText: String = "Zero-Backend P2P WebRTC Ready",
     val isPeerConnected: Boolean = false,
     val graphicsQuality: GraphicsQuality = GraphicsQuality.SMOOTH,
@@ -186,16 +188,18 @@ class GameViewModel(application: Application) : AndroidViewModel(application), P
     fun createMultiplayerRoom() {
         val code = generateRoomCode()
         val name = _uiState.value.playerName.ifBlank { "Host" }
+        val localIp = getPrimaryLocalIpAddress()
         val localPlayer = LobbyPlayer("local_player", name, isHost = true, isLocal = true, micEnabled = _uiState.value.isMicEnabled)
         _uiState.update {
             it.copy(
                 screen = ScreenMode.Lobby,
                 roomCode = code,
+                hostIpAddress = localIp,
                 isHost = true,
                 isSoloMode = false,
                 lobbyPlayers = listOf(localPlayer),
                 chatMessages = listOf(
-                    ChatMessage(nextChatId++, "sys", "Biye Bari", null, "Room $code created! Share code or connect via local Wi-Fi/Hotspot.", ChatChannel.ALL)
+                    ChatMessage(nextChatId++, "sys", "Biye Bari", null, "Room $code created! (Host IP: $localIp)", ChatChannel.ALL)
                 )
             )
         }
@@ -204,9 +208,9 @@ class GameViewModel(application: Application) : AndroidViewModel(application), P
     }
 
     fun joinMultiplayerRoom(rawCode: String) {
-        val code = rawCode.trim().filter { it.isLetterOrDigit() }.uppercase().take(4)
-        if (code.length < 4) {
-            showToast("Enter a 4-character Room Code!")
+        val input = rawCode.trim().uppercase()
+        if (input.isBlank()) {
+            showToast("Enter a Room Code or Host IP!")
             return
         }
         val name = _uiState.value.playerName.ifBlank { "Guest" }
@@ -214,17 +218,17 @@ class GameViewModel(application: Application) : AndroidViewModel(application), P
         _uiState.update {
             it.copy(
                 screen = ScreenMode.Lobby,
-                roomCode = code,
+                roomCode = input,
                 isHost = false,
                 isSoloMode = false,
                 lobbyPlayers = listOf(localPlayer),
                 chatMessages = listOf(
-                    ChatMessage(nextChatId++, "sys", "Biye Bari", null, "Connecting to Room $code via Local Network / WebRTC...", ChatChannel.ALL)
+                    ChatMessage(nextChatId++, "sys", "Biye Bari", null, "Connecting to Room $input via Local Network / WebRTC...", ChatChannel.ALL)
                 )
             )
         }
         if (_uiState.value.micPermissionGranted && _uiState.value.isMicEnabled) micMonitor.start()
-        peerController.joinRoom(code, name)
+        peerController.joinRoom(input, name)
     }
 
     fun startSoloMatch(preferredRole: Role? = null) {

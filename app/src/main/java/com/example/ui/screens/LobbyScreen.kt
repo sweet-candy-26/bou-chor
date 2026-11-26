@@ -200,6 +200,13 @@ fun LobbyScreen(
                                 letterSpacing = 4.sp,
                                 color = MarigoldGold
                             )
+                            if (uiState.isHost && !uiState.hostIpAddress.isNullOrBlank()) {
+                                Text(
+                                    text = "IP: ${uiState.hostIpAddress}",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = CngEmerald
+                                )
+                            }
                         }
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             OutlinedButton(
