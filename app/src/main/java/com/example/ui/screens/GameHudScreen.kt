@@ -107,6 +107,7 @@ import com.example.game.VenueMap
 import com.example.game.WeatherType
 import com.example.ui.BouChorUiState
 import com.example.ui.theme.BridalCrimson
+import com.example.ui.theme.ChorCharcoal
 import com.example.ui.theme.CngEmerald
 import com.example.ui.theme.FairyCyan
 import com.example.ui.theme.MamaOrange
@@ -998,17 +999,21 @@ private fun computePrimaryButtonMeta(local: PlayerEntity, world: GameWorldState)
     return when (local.role) {
         Role.BOU -> PrimaryActionMeta("SCREAM!", "ALERT [E]", BridalCrimson, WarmIvory, false)
         Role.BOU_CHOR -> {
+            val bou = world.players.firstOrNull { it.role == Role.BOU }
+            val distBou = if (bou != null) local.pos.dist2D(bou.pos) else 99f
             if (local.isCarryingBou) {
                 val nearGate = world.gates.any { local.pos.dist2D(it.pos) <= it.radius }
                 PrimaryActionMeta(
                     label = if (nearGate) "ESCAPE!" else "CARRYING",
-                    subLabel = if (nearGate) "HOLD 4s" else "GO TO GATE",
+                    subLabel = if (nearGate) "HOLD 2.5s" else "GO TO GATE",
                     color = if (nearGate) CngEmerald else MaroonCard,
                     textColor = if (nearGate) MaroonNight else WarmIvory,
                     isHold = true
                 )
+            } else if (distBou <= 3.8f) {
+                PrimaryActionMeta("KIDNAP", "HOLD 1.3s", BridalCrimson, WarmIvory, true)
             } else {
-                PrimaryActionMeta("KIDNAP", "HOLD 2s", BridalCrimson, WarmIvory, true)
+                PrimaryActionMeta("DASH!", "SPEED BOOST", ChorCharcoal, WarmIvory, false)
             }
         }
         Role.BOR -> PrimaryActionMeta("RESCUE", "HOLD 1.5s", CngEmerald, MaroonNight, true)

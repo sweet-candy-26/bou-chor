@@ -236,6 +236,7 @@ class GameEngine(
                 wallHackTimer = (p.wallHackTimer - clampedDt).coerceAtLeast(0f),
                 swingAnim = (p.swingAnim - clampedDt * 2.8f).coerceAtLeast(0f),
                 kidnapImmunityTimer = (p.kidnapImmunityTimer - clampedDt).coerceAtLeast(0f),
+                speedBoostTimer = (p.speedBoostTimer - clampedDt).coerceAtLeast(0f),
                 ability1Cooldown = (p.ability1Cooldown - clampedDt).coerceAtLeast(0f),
                 ability2Cooldown = (p.ability2Cooldown - clampedDt).coerceAtLeast(0f),
                 speechBubbleTimer = bubbleTimer,
@@ -321,7 +322,8 @@ class GameEngine(
 
             val isPlayerOutdoors = !VenueMap.isInsideBuilding(p.pos)
             var maxSpeed = p.role.baseSpeed
-            if (p.role == Role.BOU_CHOR && p.isCarryingBou) maxSpeed *= 0.85f
+            if (p.speedBoostTimer > 0f) maxSpeed *= 1.40f
+            if (p.role == Role.BOU_CHOR && p.isCarryingBou) maxSpeed *= 0.93f
             if (p.blindTimer > 0f && p.isBot) maxSpeed *= 0.55f
             // Outdoor weather slows movement on rain-slicked courtyard grass/tarmac or in dense night fog
             if (isPlayerOutdoors) {
@@ -399,6 +401,23 @@ class GameEngine(
                         )
                     )
                 }
+
+                if (p.speedBoostTimer > 0f && dustParticles.size < 64) {
+                    val backX = nextPos.x - sin(nextYaw) * 0.45f + (Random.nextFloat() - 0.5f) * 0.4f
+                    val backZ = nextPos.z - cos(nextYaw) * 0.45f + (Random.nextFloat() - 0.5f) * 0.4f
+                    dustParticles.add(
+                        DustParticle(
+                            id = nextEffectId++,
+                            pos = Vec3(backX, 0.25f, backZ),
+                            vx = (Random.nextFloat() - 0.5f) * 1.6f,
+                            vy = 0.8f + Random.nextFloat() * 1.0f,
+                            vz = (Random.nextFloat() - 0.5f) * 1.6f,
+                            size = 0.35f + Random.nextFloat() * 0.25f,
+                            life = 0.5f,
+                            maxLife = 0.5f
+                        )
+                    )
+                }
             }
 
             players[i] = p.copy(
@@ -444,55 +463,86 @@ class GameEngine(
 
                 Role.BOU_CHOR -> {
                     val bou = players[bouIdx]
-                    if (!cur.isCarryingBou) {
-                        val distToBou = cur.pos.dist2D(bou.pos)
-                        if (input.holdAction && distToBou <= 3.3f && bou.kidnapImmunityTimer <= 0f) {
-                            val prev = if (cur.holdType == HoldActionType.KIDNAP) cur.holdProgress else 0f
-                            val nextProg = (prev + clampedDt / 2.0f).coerceAtMost(1f)
+                    val distToBou = cur.pos.dist2D(bou.pos)
+                    val nearGate = if (cur.isCarryingBou) world.gates.firstOrNull { cur.pos.dist2D(it.pos) <= it.radius } else null
+
+                    // Ability 1: Speed Dash / Shotkan (Triggered when input.triggerAbility1 is pressed, or when holdAction pressed away from Bou/Gate)
+                    val isNearKidnapTarget = !cur.isCarryingBou && distToBou <= 3.8f && bou.kidnapImmunityTimer <= 0f
+                    val isNearEscapeTarget = cur.isCarryingBou && nearGate != null
+                    val wantsDash = input.triggerAbility1 || (input.holdAction && !isNearKidnapTarget && !isNearEscapeTarget)
+
+                    if (wantsDash && cur.ability1Cooldown <= 0f) {
+                        players[i] = cur.copy(
+                            speedBoostTimer = 2.8f,
+                            stunTimer = 0f,
+                            blindTimer = 0f,
+                            slipTimer = 0f,
+                            ability1Cooldown = 7.5f,
+                            ability1MaxCooldown = 7.5f
+                        )
+                        soundEngine.playChatPop()
+                        addCombatText("SHOTKAN! DASH!", cur.pos, MarigoldGold)
+                        if (cur.isLocal) {
+                            setBanner("CHOR DASHED WITH SPEED BOOST!", 2.0f)
+                        }
+                    }
+
+                    val updatedCur = players[i]
+
+                    if (!updatedCur.isCarryingBou) {
+                        if (input.holdAction && isNearKidnapTarget) {
+                            val prev = if (updatedCur.holdType == HoldActionType.KIDNAP) updatedCur.holdProgress else 0f
+                            val nextProg = (prev + clampedDt / 1.3f).coerceAtMost(1f)
                             tickCapturePulse(clampedDt)
                             if (nextProg >= 1f) {
-                                players[i] = cur.copy(isCarryingBou = true, holdType = HoldActionType.NONE, holdProgress = 0f)
+                                players[i] = updatedCur.copy(isCarryingBou = true, holdType = HoldActionType.NONE, holdProgress = 0f)
                                 players[bouIdx] = bou.copy(isCarriedInSack = true, auraExposed = false, campTimer = 0f)
-                                screamBeacon = ScreamBeacon(cur.pos, 8.0f)
+                                screamBeacon = ScreamBeacon(updatedCur.pos, 8.0f)
                                 stats.kidnapsCount++
                                 stats.lastKidnapTimestampSec = newElapsed
-                                if (cur.isLocal) {
+                                if (updatedCur.isLocal) {
                                     onLocalChorCaughtBou()
                                 }
                                 soundEngine.playScream()
-                                addCombatText("SACKED BOU!", cur.pos, BridalCrimson)
+                                addCombatText("SACKED BOU!", updatedCur.pos, BridalCrimson)
                                 setBanner("CHOR KIDNAPPED BOU! BLOCK THE 3 ESCAPE GATES!", 3.8f)
                                 cameraShake = 0.55f
                                 if (bou.isBot) triggerBotSpeech(players, bouIdx, "বাঁচাও! চোর ধরছে!", ChatChannel.ALL)
                             } else {
-                                players[i] = cur.copy(holdType = HoldActionType.KIDNAP, holdProgress = nextProg)
+                                players[i] = updatedCur.copy(holdType = HoldActionType.KIDNAP, holdProgress = nextProg)
                             }
                         } else {
-                            players[i] = cur.copy(holdType = HoldActionType.NONE, holdProgress = 0f)
+                            players[i] = updatedCur.copy(holdType = HoldActionType.NONE, holdProgress = 0f)
                         }
                     } else {
-                        val nearGate = world.gates.firstOrNull { cur.pos.dist2D(it.pos) <= it.radius }
                         if (input.holdAction && nearGate != null) {
-                            val prev = if (cur.holdType == HoldActionType.ESCAPE) cur.holdProgress else 0f
-                            val nextProg = (prev + clampedDt / 4.0f).coerceAtMost(1f)
+                            val prev = if (updatedCur.holdType == HoldActionType.ESCAPE) updatedCur.holdProgress else 0f
+                            val nextProg = (prev + clampedDt / 2.5f).coerceAtMost(1f)
                             tickCapturePulse(clampedDt)
                             if (nextProg >= 1f) {
                                 soundEngine.playCngHorn()
                                 escapedVia = nearGate.type
                             }
-                            players[i] = cur.copy(holdType = HoldActionType.ESCAPE, holdProgress = nextProg)
+                            players[i] = updatedCur.copy(holdType = HoldActionType.ESCAPE, holdProgress = nextProg)
                         } else {
-                            players[i] = cur.copy(holdType = HoldActionType.NONE, holdProgress = 0f)
+                            players[i] = updatedCur.copy(holdType = HoldActionType.NONE, holdProgress = 0f)
                         }
                     }
 
                     if (input.triggerAbility2 && players[i].ability2Cooldown <= 0f) {
-                        val behindX = cur.pos.x - sin(cur.yaw) * 1.25f
-                        val behindZ = cur.pos.z - cos(cur.yaw) * 1.25f
-                        bananas.add(BananaPeel(nextEffectId++, Vec3(behindX, 0.05f, behindZ)))
-                        players[i] = players[i].copy(ability2Cooldown = 7f, ability2MaxCooldown = 7f)
+                        val activeChor = players[i]
+                        val sx = sin(activeChor.yaw)
+                        val sz = cos(activeChor.yaw)
+                        val cx = cos(activeChor.yaw)
+                        val cz = -sin(activeChor.yaw)
+
+                        // Drop 2 banana peels side-by-side behind Chor
+                        bananas.add(BananaPeel(nextEffectId++, Vec3(activeChor.pos.x - sx * 1.2f + cx * 0.7f, 0.05f, activeChor.pos.z - sz * 1.2f + cz * 0.7f)))
+                        bananas.add(BananaPeel(nextEffectId++, Vec3(activeChor.pos.x - sx * 1.2f - cx * 0.7f, 0.05f, activeChor.pos.z - sz * 1.2f - cz * 0.7f)))
+
+                        players[i] = activeChor.copy(ability2Cooldown = 4.0f, ability2MaxCooldown = 4.0f)
                         soundEngine.playChatPop()
-                        addCombatText("BANANA!", cur.pos, MarigoldGold)
+                        addCombatText("DOUBLE BANANA!", activeChor.pos, MarigoldGold)
                     }
                 }
 
@@ -677,7 +727,7 @@ class GameEngine(
                 val p = players[i]
                 if (p.role != Role.BOU_CHOR && !p.isCarriedInSack && !p.isIncapacitated) {
                     if (p.pos.dist2D(b.pos) <= 1.25f) {
-                        players[i] = p.copy(slipTimer = 2.0f, holdType = HoldActionType.NONE, holdProgress = 0f)
+                        players[i] = p.copy(slipTimer = 2.2f, holdType = HoldActionType.NONE, holdProgress = 0f)
                         stats.bananaSlips++
                         soundEngine.playBananaSlip()
                         addCombatText("SLIPPED!!", p.pos, MarigoldGold)
@@ -1015,6 +1065,8 @@ class GameEngine(
                     .minByOrNull { it.pos.dist2D(bot.pos) }
                 val chaserDist = nearestChaser?.pos?.dist2D(bot.pos) ?: 99f
                 val dropBanana = chaserDist < 5.5f && bot.ability2Cooldown <= 0f
+                val distBou = bot.pos.dist2D(bou.pos)
+                val triggerDash = (chaserDist < 6.5f || (distBou > 8f && !bot.isCarryingBou)) && bot.ability1Cooldown <= 0f
 
                 if (bot.isCarryingBou) {
                     val bestGate = gates.maxByOrNull { gate ->
@@ -1023,13 +1075,12 @@ class GameEngine(
                     } ?: gates.first()
                     val distGate = bot.pos.dist2D(bestGate.pos)
                     if (distGate <= bestGate.radius - 0.4f) {
-                        PlayerActionInput(0f, 0f, holdAction = true, triggerAbility2 = dropBanana)
+                        PlayerActionInput(0f, 0f, holdAction = true, triggerAbility1 = triggerDash, triggerAbility2 = dropBanana)
                     } else {
                         steerToward(bestGate.pos)
-                        PlayerActionInput(scratchSteerX, scratchSteerZ, holdAction = distGate <= bestGate.radius, triggerAbility2 = dropBanana)
+                        PlayerActionInput(scratchSteerX, scratchSteerZ, holdAction = distGate <= bestGate.radius, triggerAbility1 = triggerDash, triggerAbility2 = dropBanana)
                     }
                 } else {
-                    val distBou = bot.pos.dist2D(bou.pos)
                     val bouVisibleInFog = bou.auraExposed || distBou < 24f * visScale
                     if (distBou <= 2.9f && bou.kidnapImmunityTimer <= 0f) {
                         val closeIn = if (distBou > 1.85f) 0.45f else 0f
@@ -1037,12 +1088,13 @@ class GameEngine(
                             (bou.pos.x - bot.pos.x) * closeIn,
                             (bou.pos.z - bot.pos.z) * closeIn,
                             holdAction = true,
+                            triggerAbility1 = triggerDash,
                             triggerAbility2 = dropBanana
                         )
                     } else {
                         val chaseGoal = if (bouVisibleInFog) Vec3(bou.pos.x, 0f, bou.pos.z) else getOrPickWanderTarget(bot)
                         steerToward(chaseGoal)
-                        PlayerActionInput(scratchSteerX, scratchSteerZ, triggerAbility2 = dropBanana)
+                        PlayerActionInput(scratchSteerX, scratchSteerZ, triggerAbility1 = triggerDash, triggerAbility2 = dropBanana)
                     }
                 }
             }

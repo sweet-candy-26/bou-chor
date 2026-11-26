@@ -60,10 +60,10 @@ enum class Role(
         bengaliTitle = "Thief • বউ চোর",
         team = Team.THIEF,
         accentColor = ChorCharcoal,
-        baseSpeed = 8.9f,
-        ability1Name = "KIDNAP",
+        baseSpeed = 9.8f,
+        ability1Name = "DASH",
         ability2Name = "BANANA",
-        shortGoal = "Sack Bou (2s hold) & escape via CNG, Microbus or Rickshaw!"
+        shortGoal = "Dash (Sprint Boost), drop Bananas, Sack Bou (1.3s hold) & escape!"
     ),
     BOR(
         displayName = "BOR",
@@ -142,7 +142,8 @@ data class PlayerEntity(
     val campAnchorX: Float = 0f,
     val campAnchorZ: Float = 0f,
     val campTimer: Float = 0f,
-    val auraExposed: Boolean = false
+    val auraExposed: Boolean = false,
+    val speedBoostTimer: Float = 0f
 ) {
     val isIncapacitated: Boolean get() = stunTimer > 0f || slipTimer > 0f
 }
