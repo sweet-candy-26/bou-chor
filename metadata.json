@@ -1,0 +1,6 @@
+{
+  "name": "Bou Chor",
+  "description": "Chaotic 3D Bangladeshi wedding party multiplayer chase game with 5 unique roles, live proximity voice chat, Bengali quick-chat speech bubbles, and smart AI bots.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

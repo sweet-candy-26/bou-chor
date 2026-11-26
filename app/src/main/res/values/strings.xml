@@ -1,0 +1,29 @@
+<resources>
+    <string name="app_name">Bou Chor</string>
+    <string name="tagline">Bangladeshi Wedding Thief • 3D Chaos</string>
+    <string name="btn_create_room">Create Room</string>
+    <string name="btn_join_room">Join Room</string>
+    <string name="btn_play_solo">Play Solo (1P + 4 Smart AI Bots)</string>
+    <string name="label_room_code">Room Code</string>
+    <string name="label_player_name">Your Nickname</string>
+    <string name="btn_start_match">Start Match</string>
+    <string name="btn_copy_link">Copy Invite</string>
+    <string name="btn_play_again">Play Again (Shuffle Roles)</string>
+    <string name="btn_back_to_lobby">Back to Lobby</string>
+    <string name="quick_chat_1">বাঁচাও! চোর ধরছে!</string>
+    <string name="quick_chat_2">মামা বাঁশ নিয়া তাড়াতাড়ি আয়!</string>
+    <string name="quick_chat_3">চোর CNG-র দিকে যাইতেছে!</string>
+    <string name="quick_chat_4">হাহা, ধরতে পারলি না!</string>
+    <string name="leaderboard_title">LOCAL LEADERBOARD</string>
+    <string name="leaderboard_subtitle">Saved on this device across sessions</string>
+    <string name="label_bou_escapes">Bou Escapes</string>
+    <string name="label_chor_catches">Chor Catches</string>
+    <string name="leaderboard_empty_title">No Wedding Legends Yet</string>
+    <string name="leaderboard_empty_body">Survive a match as Bou or catch Bou as Chor to record your stats on this device.</string>
+    <string name="btn_open_leaderboard">View Leaderboard</string>
+    <string name="btn_reset_leaderboard">Reset</string>
+    <string name="btn_close">Close</string>
+    <string name="btn_cancel">Cancel</string>
+    <string name="leaderboard_reset_confirm_title">Reset Local Leaderboard?</string>
+    <string name="leaderboard_reset_confirm_body">This will permanently erase all saved Bou Escapes and Chor Catches stored on this device.</string>
+</resources>
