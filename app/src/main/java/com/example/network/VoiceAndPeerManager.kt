@@ -10,8 +10,10 @@ import android.media.MediaRecorder
 import android.webkit.JavascriptInterface
 import android.webkit.PermissionRequest
 import android.webkit.WebChromeClient
+import android.webkit.WebResourceRequest
 import android.webkit.WebSettings
 import android.webkit.WebView
+import android.webkit.WebViewClient
 import androidx.compose.foundation.layout.size
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
@@ -644,6 +646,11 @@ fun HeadlessPeerBridge(
                 settings.mediaPlaybackRequiresUserGesture = false
                 settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
                 addJavascriptInterface(controller.JsBridge(), "AndroidBridge")
+                webViewClient = object : WebViewClient() {
+                    override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
+                        return true
+                    }
+                }
                 webChromeClient = object : WebChromeClient() {
                     override fun onPermissionRequest(request: PermissionRequest) {
                         val wantsAudio = request.resources.contains(PermissionRequest.RESOURCE_AUDIO_CAPTURE)
@@ -656,7 +663,7 @@ fun HeadlessPeerBridge(
                 }
                 controller.attachWebView(this)
                 loadDataWithBaseURL(
-                    "https://bouchor.app/",
+                    "https://localhost/",
                     controller.getBridgeHtml(),
                     "text/html",
                     "UTF-8",

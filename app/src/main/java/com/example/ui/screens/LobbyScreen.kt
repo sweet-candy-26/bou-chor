@@ -211,7 +211,7 @@ fun LobbyScreen(
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             OutlinedButton(
                                 onClick = {
-                                    val link = "Join my BOU CHOR wedding match! Room Code: ${uiState.roomCode} (https://bouchor.app/join/${uiState.roomCode})"
+                                    val link = "Join my BOU CHOR wedding match! Room Code: ${uiState.roomCode}" + if (!uiState.hostIpAddress.isNullOrBlank()) " (Host IP: ${uiState.hostIpAddress})" else ""
                                     val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                                     cm.setPrimaryClip(ClipData.newPlainText("Bou Chor Room", link))
                                     onCopyToast("Room ${uiState.roomCode} invite copied!")
