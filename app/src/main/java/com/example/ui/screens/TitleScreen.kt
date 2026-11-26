@@ -324,8 +324,8 @@ fun TitleScreen(
                         ) {
                             OutlinedTextField(
                                 value = joinCode,
-                                onValueChange = { joinCode = it.filter { ch -> ch.isLetterOrDigit() }.uppercase().take(4) },
-                                label = { Text("4-Char Code") },
+                                onValueChange = { joinCode = it.filter { ch -> ch.isLetterOrDigit() || ch == '.' || ch == ':' }.uppercase().take(15) },
+                                label = { Text("Code or Host IP") },
                                 singleLine = true,
                                 modifier = Modifier
                                     .weight(1f)

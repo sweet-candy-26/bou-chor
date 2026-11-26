@@ -22,12 +22,14 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.io.BufferedReader
 import java.io.InputStreamReader
@@ -35,8 +37,10 @@ import java.io.OutputStreamWriter
 import java.io.PrintWriter
 import java.net.DatagramPacket
 import java.net.DatagramSocket
+import java.net.Inet4Address
 import java.net.InetAddress
 import java.net.InetSocketAddress
+import java.net.NetworkInterface
 import java.net.ServerSocket
 import java.net.Socket
 import java.net.SocketTimeoutException
@@ -159,7 +163,7 @@ class BouChorLanManager(private val listener: PeerEventsListener) {
     fun startHosting(roomCode: String, playerName: String) {
         stopAll()
         isHosting = true
-        currentRoomCode = roomCode.uppercase()
+        currentRoomCode = roomCode.trim().uppercase()
         myName = playerName
 
         serverJob = scope.launch {
@@ -186,16 +190,39 @@ class BouChorLanManager(private val listener: PeerEventsListener) {
                     put("port", 8988)
                 }.toString().toByteArray()
 
-                val target = InetAddress.getByName("255.255.255.255")
-                val packet = DatagramPacket(msg, msg.size, target, 8989)
                 while (isActive) {
-                    try {
-                        ds.send(packet)
-                    } catch (_: Throwable) {}
-                    delay(1200)
+                    val targets = getBroadcastAddresses()
+                    for (target in targets) {
+                        try {
+                            val packet = DatagramPacket(msg, msg.size, target, 8989)
+                            ds.send(packet)
+                        } catch (_: Throwable) {}
+                    }
+                    delay(800)
                 }
             } catch (_: Throwable) {}
         }
+    }
+
+    private fun getBroadcastAddresses(): List<InetAddress> {
+        val list = mutableSetOf<InetAddress>()
+        runCatching { list.add(InetAddress.getByName("255.255.255.255")) }
+        runCatching { list.add(InetAddress.getByName("192.168.43.255")) }
+        runCatching { list.add(InetAddress.getByName("10.0.2.255")) }
+        runCatching {
+            val interfaces = NetworkInterface.getNetworkInterfaces()
+            while (interfaces.hasMoreElements()) {
+                val netIf = interfaces.nextElement()
+                if (netIf.isLoopback || !netIf.isUp) continue
+                for (interfaceAddress in netIf.interfaceAddresses) {
+                    val bcast = interfaceAddress.broadcast
+                    if (bcast != null) {
+                        list.add(bcast)
+                    }
+                }
+            }
+        }
+        return list.toList()
     }
 
     private suspend fun handleHostClient(socket: Socket) {
@@ -234,69 +261,147 @@ class BouChorLanManager(private val listener: PeerEventsListener) {
     fun startJoining(roomCode: String, playerName: String) {
         stopAll()
         isHosting = false
-        currentRoomCode = roomCode.uppercase()
+        val targetInput = roomCode.trim().uppercase()
+        currentRoomCode = targetInput
         myName = playerName
 
         searchJob = scope.launch {
             var connected = false
-            val candidateIps = mutableListOf("192.168.43.1")
+            val discoveredIps = Collections.synchronizedSet(mutableSetOf<String>())
+
+            if (targetInput.contains(".")) {
+                discoveredIps.add(targetInput)
+            }
+
+            discoveredIps.add("192.168.43.1")
+            discoveredIps.add("10.0.2.2")
+            discoveredIps.add("10.0.2.15")
+            discoveredIps.add("127.0.0.1")
 
             val beaconSocket = try {
                 DatagramSocket(8989).apply {
-                    soTimeout = 1500
+                    soTimeout = 1200
                     broadcast = true
                 }
             } catch (_: Throwable) { null }
 
-            val buf = ByteArray(1024)
-            val packet = DatagramPacket(buf, buf.size)
             val startTime = System.currentTimeMillis()
 
-            while (isActive && !connected && (System.currentTimeMillis() - startTime < 4500)) {
-                if (beaconSocket != null) {
-                    try {
-                        beaconSocket.receive(packet)
-                        val text = String(packet.data, 0, packet.length)
-                        val obj = JSONObject(text)
-                        if (obj.optString("code").equals(currentRoomCode, ignoreCase = true)) {
-                            val hostIp = packet.address?.hostAddress
-                            if (hostIp != null && !candidateIps.contains(hostIp)) {
-                                candidateIps.add(0, hostIp)
+            // 1. UDP Listener coroutine
+            launch {
+                val buf = ByteArray(1024)
+                val packet = DatagramPacket(buf, buf.size)
+                while (isActive && !connected) {
+                    if (beaconSocket != null) {
+                        try {
+                            beaconSocket.receive(packet)
+                            val text = String(packet.data, 0, packet.length)
+                            val obj = JSONObject(text)
+                            val code = obj.optString("code")
+                            if (code.equals(currentRoomCode, ignoreCase = true) || targetInput.contains(".")) {
+                                val hostIp = packet.address?.hostAddress
+                                if (hostIp != null) {
+                                    discoveredIps.add(hostIp)
+                                }
                             }
-                        }
-                    } catch (_: SocketTimeoutException) {
-                    } catch (_: Throwable) {}
+                        } catch (_: Throwable) {}
+                    }
+                    delay(200)
                 }
+            }
 
-                for (ip in candidateIps) {
-                    try {
-                        val s = Socket()
-                        s.connect(InetSocketAddress(ip, 8988), 800)
+            // 2. Parallel Fast Subnet IP Scanner
+            val localSubnets = getLocalSubnetPrefixes()
+
+            while (isActive && !connected && (System.currentTimeMillis() - startTime < 12000)) {
+                val snapshot = discoveredIps.toList()
+                for (ip in snapshot) {
+                    if (connected) break
+                    val s = tryConnectIp(ip)
+                    if (s != null) {
                         clientSocket = s
                         connected = true
                         listener.onPeerStatus("Connected to Host via Local Network ($ip)", true)
                         clientJob = launch { handleClientSession(s) }
                         break
-                    } catch (_: Throwable) {}
+                    }
                 }
-                delay(500)
+
+                if (!connected) {
+                    for (prefix in localSubnets) {
+                        if (connected) break
+                        val jobs = (1..254).map { lastOctet ->
+                            async {
+                                if (connected) return@async null
+                                val testIp = "$prefix$lastOctet"
+                                tryConnectIp(testIp)
+                            }
+                        }
+                        for (j in jobs) {
+                            val resSocket = j.await()
+                            if (resSocket != null && !connected) {
+                                clientSocket = resSocket
+                                connected = true
+                                listener.onPeerStatus("Connected to Host via Local Network ($prefix...)", true)
+                                clientJob = launch { handleClientSession(resSocket) }
+                                break
+                            }
+                        }
+                    }
+                }
+
+                delay(600)
             }
             try { beaconSocket?.close() } catch (_: Throwable) {}
         }
     }
 
-    private suspend fun handleClientSession(socket: Socket) {
-        val reader = BufferedReader(InputStreamReader(socket.getInputStream()))
-        val hostId = "lan_host"
+    private suspend fun tryConnectIp(ip: String): Socket? = withContext(Dispatchers.IO) {
         try {
+            val s = Socket()
+            s.connect(InetSocketAddress(ip, 8988), 350)
+            val out = PrintWriter(OutputStreamWriter(s.getOutputStream()), true)
             val hello = JSONObject().apply {
                 put("type", "hello")
                 put("name", myName)
                 put("isHost", false)
                 put("roomCode", currentRoomCode)
             }.toString()
-            sendToSocket(socket, hello)
+            out.println(hello)
+            s
+        } catch (_: Throwable) {
+            null
+        }
+    }
 
+    private fun getLocalSubnetPrefixes(): List<String> {
+        val prefixes = mutableListOf<String>()
+        try {
+            val interfaces = NetworkInterface.getNetworkInterfaces()
+            while (interfaces.hasMoreElements()) {
+                val netIf = interfaces.nextElement()
+                if (netIf.isLoopback || !netIf.isUp) continue
+                val addrs = netIf.inetAddresses
+                while (addrs.hasMoreElements()) {
+                    val addr = addrs.nextElement()
+                    if (!addr.isLoopbackAddress && addr is Inet4Address) {
+                        val host = addr.hostAddress ?: continue
+                        val lastDot = host.lastIndexOf('.')
+                        if (lastDot > 0) {
+                            val prefix = host.substring(0, lastDot + 1)
+                            if (!prefixes.contains(prefix)) prefixes.add(prefix)
+                        }
+                    }
+                }
+            }
+        } catch (_: Throwable) {}
+        return prefixes
+    }
+
+    private suspend fun handleClientSession(socket: Socket) {
+        val reader = BufferedReader(InputStreamReader(socket.getInputStream()))
+        val hostId = "lan_host"
+        try {
             while (scope.isActive && socket.isConnected && !socket.isClosed) {
                 val line = reader.readLine() ?: break
                 val obj = JSONObject(line)

@@ -610,7 +610,11 @@ class GameViewModel(application: Application) : AndroidViewModel(application), P
                 isLocal = false
             )
             val updated = current.lobbyPlayers + newPlayer
-            current.copy(lobbyPlayers = updated)
+            current.copy(
+                lobbyPlayers = updated,
+                isPeerConnected = true,
+                peerStatusText = "Room ${current.roomCode} Live"
+            )
         }
         appendChat("sys", "Biye Bari", null, "$name joined the wedding!", ChatChannel.ALL, playSound = true)
 
@@ -690,7 +694,13 @@ class GameViewModel(application: Application) : AndroidViewModel(application), P
                     } else {
                         syncedList
                     }
-                    _uiState.update { it.copy(lobbyPlayers = finalList) }
+                    _uiState.update {
+                        it.copy(
+                            lobbyPlayers = finalList,
+                            isPeerConnected = true,
+                            peerStatusText = "Room ${it.roomCode} Live"
+                        )
+                    }
                 }
 
                 "start_match" -> {
