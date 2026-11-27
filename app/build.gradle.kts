@@ -16,8 +16,8 @@ android {
     applicationId = "com.aistudio.bouchor.kxdmvr"
     minSdk = 24
     targetSdk = 36
-    versionCode = 7
-    versionName = "1.4.3"
+    versionCode = 8
+    versionName = "1.4.4"
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
   }
