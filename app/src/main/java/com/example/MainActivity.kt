@@ -99,6 +99,9 @@ fun BouChorApp(viewModel: GameViewModel = viewModel()) {
                         viewModel.joinMultiplayerRoom(code)
                     },
                     onPlaySolo = { role ->
+                        if (!uiState.micPermissionGranted) {
+                            micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                        }
                         viewModel.startSoloMatch(role)
                     },
                     onClearLeaderboard = viewModel::clearLocalLeaderboard

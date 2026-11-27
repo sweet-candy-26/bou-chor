@@ -354,4 +354,99 @@ class RoomJoinAndRoleTest {
         assertEquals(Team.WEDDING, finalRes!!.winningTeam)
         assertEquals("JAMAI ESCAPED WITH BOU!", finalRes.headline)
     }
+
+    @Test
+    fun `local mama bonk and multiplayer gameplay events sync across human players`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val emittedEvents = mutableListOf<Pair<String, String>>()
+        var hostMatchEnd: MatchResult? = null
+
+        val hostEngine = GameEngine(
+            soundEngine = SoundEngine(context),
+            onBotChat = { _, _, _ -> },
+            onMatchFinished = { hostMatchEnd = it },
+            onGameplayEvent = { ev, json -> emittedEvents.add(ev to json) }
+        )
+
+        var guestMatchEnd: MatchResult? = null
+        val guestEngine = GameEngine(
+            soundEngine = SoundEngine(context),
+            onBotChat = { _, _, _ -> },
+            onMatchFinished = { guestMatchEnd = it }
+        )
+
+        val lobby = listOf(
+            LobbyPlayer("host_mama", "MamaHost", isHost = true, isLocal = true),
+            LobbyPlayer("guest_chor", "ChorGuest", isHost = false, isLocal = false)
+        )
+        hostEngine.setPresetMultiplayerRoles(
+            mapOf("host_mama" to Role.MAMA, "guest_chor" to Role.BOU_CHOR)
+        )
+        guestEngine.setPresetMultiplayerRoles(
+            mapOf("host_mama" to Role.MAMA, "guest_chor" to Role.BOU_CHOR)
+        )
+
+        var hostWorld = hostEngine.createInitialWorld(lobby, isSoloMode = false, roomCode = "SYNC1")
+        // Guest sees same roles with Guest as isLocal=true, Host as isLocal=false
+        val guestLobby = listOf(
+            LobbyPlayer("guest_chor", "ChorGuest", isHost = false, isLocal = true),
+            LobbyPlayer("host_mama", "MamaHost", isHost = true, isLocal = false)
+        )
+        var guestWorld = guestEngine.createInitialWorld(guestLobby, isSoloMode = false, roomCode = "SYNC1")
+
+        // Place Host Mama 2.5u from Guest Chor facing sideways (tests soft self aim-assist too)
+        val chorPos = hostWorld.players.first { it.role == Role.BOU_CHOR }.pos
+        hostWorld = hostWorld.copy(
+            players = hostWorld.players.map {
+                when (it.role) {
+                    Role.MAMA -> it.copy(pos = Vec3(chorPos.x - 2.4f, 0f, chorPos.z), yaw = 0f)
+                    Role.BOU_CHOR -> it.copy(isCarryingBou = true)
+                    Role.BOU -> it.copy(isCarriedInSack = true)
+                    else -> it
+                }
+            }
+        )
+
+        hostWorld = hostEngine.step(
+            world = hostWorld,
+            dt = 0.05f,
+            moveInputX = 0f,
+            moveInputZ = 0f,
+            targetCameraYaw = 0f,
+            targetCameraPitch = 0.6f,
+            targetCameraDist = 14f,
+            ability1Pressed = true,
+            ability1Held = false,
+            ability2Pressed = false,
+            localMicLevel = 0f,
+            allowRandomWeatherTransition = false,
+            simulateBotsLocally = true
+        )
+
+        val hostChor = hostWorld.players.first { it.role == Role.BOU_CHOR }
+        assertTrue("Self Mama bash should stun nearby Chor", hostChor.stunTimer >= 2.5f)
+        assertFalse("Chor must drop Bou on Mama bonk", hostChor.isCarryingBou)
+
+        val bonkEvent = emittedEvents.firstOrNull { it.first == "chor_hit" }
+        assertTrue("Host must emit chor_hit gameplay event", bonkEvent != null)
+
+        // Apply emitted event on Guest device where Chor is a REAL human player!
+        guestWorld = guestEngine.applyRemoteGameplayEvent(guestWorld, JSONObject(bonkEvent!!.second))
+        val guestChor = guestWorld.players.first { it.role == Role.BOU_CHOR }
+        assertTrue("Remote Human Chor must receive Mama stun", guestChor.stunTimer >= 2.5f)
+        assertFalse("Remote Human Chor must drop Bou", guestChor.isCarryingBou)
+
+        // Also verify remote match_end event syncs to Guest cleanly
+        val winJson = JSONObject().apply {
+            put("type", "game_event")
+            put("ev", "match_end")
+            put("team", Team.WEDDING.name)
+            put("via", "CNG")
+            put("jamai", true)
+            put("time", 42.0)
+        }
+        guestEngine.applyRemoteGameplayEvent(guestWorld, winJson)
+        assertEquals("JAMAI ESCAPED WITH BOU!", guestMatchEnd?.headline)
+        assertEquals(null, hostMatchEnd)
+    }
 }

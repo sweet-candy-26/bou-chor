@@ -96,6 +96,7 @@ class GameViewModel(application: Application) : AndroidViewModel(application), P
             appendChat(sender.id, sender.name, sender.role, text, channel, playSound = true)
         },
         onMatchFinished = { result ->
+            if (_uiState.value.screen !is ScreenMode.Playing) return@GameEngine
             stopMatchLoop()
             val localPlayer = latestWorld.localPlayer
             val activeName = LeaderboardRepository.normalizeName(localPlayer?.name ?: _uiState.value.playerName)
@@ -121,6 +122,11 @@ class GameViewModel(application: Application) : AndroidViewModel(application), P
                 leaderboardRepository.recordChorCatch(activeName)
             }
             showToast("+1 Chor Catch saved to Local Leaderboard!")
+        },
+        onGameplayEvent = { _, payloadJson ->
+            if (!_uiState.value.isSoloMode) {
+                peerController.broadcastJson(payloadJson)
+            }
         }
     )
 
@@ -140,8 +146,19 @@ class GameViewModel(application: Application) : AndroidViewModel(application), P
     private var gameLoopJob: Job? = null
     private var nextChatId = 1L
     private var netBroadcastCounter = 0
+    @Volatile private var lastCarryEventMs = 0L
 
     init {
+        micMonitor.onEncodedVoiceFrame = { encodedFrame ->
+            val st = _uiState.value
+            if (!st.isSoloMode &&
+                st.isMicEnabled &&
+                st.micPermissionGranted &&
+                st.lobbyPlayers.any { !it.isLocal && !it.isBot }
+            ) {
+                peerController.broadcastVoiceFrame(encodedFrame)
+            }
+        }
         viewModelScope.launch {
             micMonitor.micLevel.collect { level ->
                 _uiState.update { st ->
@@ -164,6 +181,7 @@ class GameViewModel(application: Application) : AndroidViewModel(application), P
 
     fun onMicPermissionResult(granted: Boolean) {
         _uiState.update { it.copy(micPermissionGranted = granted) }
+        peerController.setAudioControls(_uiState.value.isMicEnabled, _uiState.value.isSpeakerMuted)
         if (granted && _uiState.value.isMicEnabled) {
             micMonitor.start()
         }
@@ -212,6 +230,7 @@ class GameViewModel(application: Application) : AndroidViewModel(application), P
                 )
             )
         }
+        peerController.setAudioControls(_uiState.value.isMicEnabled, _uiState.value.isSpeakerMuted)
         if (_uiState.value.micPermissionGranted && _uiState.value.isMicEnabled) micMonitor.start()
         peerController.createRoom(code, name)
     }
@@ -244,6 +263,7 @@ class GameViewModel(application: Application) : AndroidViewModel(application), P
                 )
             )
         }
+        peerController.setAudioControls(_uiState.value.isMicEnabled, _uiState.value.isSpeakerMuted)
         if (_uiState.value.micPermissionGranted && _uiState.value.isMicEnabled) micMonitor.start()
         peerController.joinRoom(input, name)
     }
@@ -280,7 +300,8 @@ class GameViewModel(application: Application) : AndroidViewModel(application), P
             }
             val assignmentsArray = org.json.JSONArray()
             val roleMap = mutableMapOf<String, Role>()
-            st.lobbyPlayers.forEachIndexed { i, p ->
+            val humans = st.lobbyPlayers.take(5)
+            humans.forEachIndexed { i, p ->
                 val assignedRole = allRoles.getOrElse(i) { Role.entries[i % Role.entries.size] }
                 roleMap[p.id] = assignedRole
                 val assignObj = JSONObject().apply {
@@ -289,6 +310,19 @@ class GameViewModel(application: Application) : AndroidViewModel(application), P
                     put("role", assignedRole.name)
                 }
                 assignmentsArray.put(assignObj)
+            }
+            val botCount = (5 - humans.size).coerceAtLeast(0)
+            for (bi in 0 until botCount) {
+                val botId = "bot_$bi"
+                val assignedRole = allRoles.getOrElse(humans.size + bi) { Role.entries[(humans.size + bi) % Role.entries.size] }
+                roleMap[botId] = assignedRole
+                assignmentsArray.put(
+                    JSONObject().apply {
+                        put("id", botId)
+                        put("name", botId)
+                        put("role", assignedRole.name)
+                    }
+                )
             }
             gameEngine.setPresetMultiplayerRoles(roleMap)
 
@@ -362,6 +396,7 @@ class GameViewModel(application: Application) : AndroidViewModel(application), P
                 lastMatchRecordedChorCatches = 0
             )
         }
+        peerController.setAudioControls(st.isMicEnabled, st.isSpeakerMuted)
         if (st.micPermissionGranted && st.isMicEnabled) micMonitor.start()
         soundEngine.playTaskComplete()
         startMatchLoop()
@@ -415,20 +450,9 @@ class GameViewModel(application: Application) : AndroidViewModel(application), P
                     ability2Pressed = a2Press,
                     ability3Pressed = a3Press,
                     localMicLevel = st.localMicLevel,
-                    allowRandomWeatherTransition = st.isSoloMode || st.isHost
+                    allowRandomWeatherTransition = st.isSoloMode || st.isHost,
+                    simulateBotsLocally = st.isSoloMode || st.isHost
                 )
-
-                // Broadcast one-time Chor Mama-Slow hex to peers when triggered locally
-                if (!st.isSoloMode &&
-                    prevWorld.localPlayer?.mamaSlowUsed == false &&
-                    nextWorld.localPlayer?.mamaSlowUsed == true
-                ) {
-                    val slowJson = JSONObject().apply {
-                        put("type", "mama_slow")
-                        put("senderId", peerController.localPeerId)
-                    }.toString()
-                    peerController.broadcastJson(slowJson)
-                }
 
                 // Direct 60 FPS Canvas draw-only invalidation (zero Compose HUD tree recomposition!)
                 latestWorld = nextWorld
@@ -449,6 +473,7 @@ class GameViewModel(application: Application) : AndroidViewModel(application), P
                 val localPrev = prevWorld.localPlayer
                 val localNext = nextWorld.localPlayer
                 val urgentHudChange = (localPrev?.isCarriedInSack != localNext?.isCarriedInSack) ||
+                    (localPrev?.isCarriedByBor != localNext?.isCarriedByBor) ||
                     ((localPrev?.blindTimer ?: 0f) > 0f != (localNext?.blindTimer ?: 0f) > 0f) ||
                     (prevWorld.bannerAlertText != nextWorld.bannerAlertText) ||
                     (prevWorld.weather != nextWorld.weather) ||
@@ -460,10 +485,10 @@ class GameViewModel(application: Application) : AndroidViewModel(application), P
                     _uiState.update { it.copy(world = nextWorld, currentFps = liveFps) }
                 }
 
-                // Sync spatial proximity voice & P2P transform packets at ~15Hz
+                // Sync spatial proximity voice, P2P human transforms & Host bots/tasks
                 netBroadcastCounter++
                 if (!st.isSoloMode && netBroadcastCounter % 4 == 0) {
-                    syncMultiplayerAndProximityVoice(nextWorld, st.isTeamRadioEnabled)
+                    syncMultiplayerAndProximityVoice(nextWorld, st.isTeamRadioEnabled, st.isHost)
                 }
 
                 delay(16L)
@@ -476,7 +501,7 @@ class GameViewModel(application: Application) : AndroidViewModel(application), P
         gameLoopJob = null
     }
 
-    private fun syncMultiplayerAndProximityVoice(world: GameWorldState, teamRadioOn: Boolean) {
+    private fun syncMultiplayerAndProximityVoice(world: GameWorldState, teamRadioOn: Boolean, isHost: Boolean) {
         val local = world.localPlayer ?: return
         val json = JSONObject().apply {
             put("type", "pos")
@@ -491,8 +516,51 @@ class GameViewModel(application: Application) : AndroidViewModel(application), P
             put("boost", local.speedBoostTimer > 0f)
             put("stun", local.stunTimer > 0f)
             put("slow", local.slowTimer > 0f)
+            put("blind", local.blindTimer > 0f)
+            put("slip", local.slipTimer > 0f)
         }.toString()
         peerController.broadcastJson(json)
+
+        if (isHost && netBroadcastCounter % 8 == 0) {
+            val botsArr = org.json.JSONArray()
+            for (p in world.players) {
+                if (p.isBot) {
+                    botsArr.put(
+                        JSONObject().apply {
+                            put("id", p.id)
+                            put("x", p.pos.x.toDouble())
+                            put("z", p.pos.z.toDouble())
+                            put("yaw", p.yaw.toDouble())
+                            put("moving", p.isMoving)
+                            put("carrying", p.isCarryingBou)
+                            put("sack", p.isCarriedInSack)
+                            put("carriedByBor", p.isCarriedByBor)
+                            put("boost", p.speedBoostTimer > 0f)
+                            put("stun", p.stunTimer > 0f)
+                            put("slow", p.slowTimer > 0f)
+                            put("slowUsed", p.mamaSlowUsed)
+                        }
+                    )
+                }
+            }
+            val tasksArr = org.json.JSONArray()
+            for (t in world.tasks) {
+                tasksArr.put(
+                    JSONObject().apply {
+                        put("p", t.progress.toDouble())
+                        put("c", t.completed)
+                    }
+                )
+            }
+            val syncWorldJson = JSONObject().apply {
+                put("type", "world_sync")
+                put("senderId", peerController.localPeerId)
+                put("time", world.timeRemainingSec.toDouble())
+                put("bots", botsArr)
+                put("tasks", tasksArr)
+            }.toString()
+            peerController.broadcastJson(syncWorldJson)
+        }
 
         world.players.filter { !it.isLocal && !it.isBot }.forEach { remote ->
             val bothOnTeamRadio = teamRadioOn && local.role.hasTeamRadio() && remote.role.hasTeamRadio()
@@ -828,6 +896,9 @@ class GameViewModel(application: Application) : AndroidViewModel(application), P
                     val boost = obj.optBoolean("boost", false)
                     val stun = obj.optBoolean("stun", false)
                     val slowed = obj.optBoolean("slow", false)
+                    val blind = obj.optBoolean("blind", false)
+                    val slip = obj.optBoolean("slip", false)
+                    val allowCarryOverwrite = (System.currentTimeMillis() - lastCarryEventMs) > 900L
                     latestWorld = latestWorld.copy(
                         players = latestWorld.players.map { p ->
                             if (p.id == senderId) {
@@ -836,16 +907,80 @@ class GameViewModel(application: Application) : AndroidViewModel(application), P
                                     yaw = yaw,
                                     isMoving = moving,
                                     walkPhase = if (moving) p.walkPhase + 0.35f else p.walkPhase,
-                                    isCarryingBou = carrying,
-                                    isCarriedInSack = sack,
-                                    isCarriedByBor = carriedByBor,
-                                    speedBoostTimer = if (boost) 0.3f else 0f,
-                                    stunTimer = if (stun) 0.3f else 0f,
-                                    slowTimer = if (slowed && p.slowTimer <= 0f) 0.35f else if (!slowed && p.role != Role.MAMA) 0f else p.slowTimer
+                                    isCarryingBou = if (allowCarryOverwrite) carrying else p.isCarryingBou,
+                                    isCarriedInSack = if (allowCarryOverwrite) sack else p.isCarriedInSack,
+                                    isCarriedByBor = if (allowCarryOverwrite) carriedByBor else p.isCarriedByBor,
+                                    speedBoostTimer = maxOf(p.speedBoostTimer, if (boost) 0.3f else 0f),
+                                    stunTimer = maxOf(p.stunTimer, if (stun) 0.35f else 0f),
+                                    slowTimer = maxOf(p.slowTimer, if (slowed) 0.35f else 0f),
+                                    blindTimer = maxOf(p.blindTimer, if (blind) 0.35f else 0f),
+                                    slipTimer = maxOf(p.slipTimer, if (slip) 0.35f else 0f)
                                 )
                             } else p
                         }
                     )
+                }
+
+                "game_event" -> {
+                    val ev = obj.optString("ev", "")
+                    if (ev in setOf("kidnap_bou", "rescue_bou", "bor_pickup_bou", "bou_hop_off", "chor_hit", "banana_slip")) {
+                        lastCarryEventMs = System.currentTimeMillis()
+                    }
+                    latestWorld = gameEngine.applyRemoteGameplayEvent(latestWorld, obj)
+                }
+
+                "world_sync" -> {
+                    if (!_uiState.value.isHost) {
+                        val timeLeft = obj.optDouble("time", latestWorld.timeRemainingSec.toDouble()).toFloat()
+                        val botsArr = obj.optJSONArray("bots")
+                        val botMap = mutableMapOf<String, JSONObject>()
+                        if (botsArr != null) {
+                            for (i in 0 until botsArr.length()) {
+                                val bObj = botsArr.getJSONObject(i)
+                                botMap[bObj.getString("id")] = bObj
+                            }
+                        }
+                        val allowCarryOverwrite = (System.currentTimeMillis() - lastCarryEventMs) > 900L
+                        val updatedPlayers = latestWorld.players.map { p ->
+                            val b = if (p.isBot) botMap[p.id] else null
+                            if (b != null) {
+                                val moving = b.optBoolean("moving", false)
+                                val stun = b.optBoolean("stun", false)
+                                val slowed = b.optBoolean("slow", false)
+                                val boost = b.optBoolean("boost", false)
+                                p.copy(
+                                    pos = Vec3(b.optDouble("x", p.pos.x.toDouble()).toFloat(), 0f, b.optDouble("z", p.pos.z.toDouble()).toFloat()),
+                                    yaw = b.optDouble("yaw", p.yaw.toDouble()).toFloat(),
+                                    isMoving = moving,
+                                    walkPhase = if (moving) p.walkPhase + 0.35f else p.walkPhase,
+                                    isCarryingBou = if (allowCarryOverwrite) b.optBoolean("carrying", p.isCarryingBou) else p.isCarryingBou,
+                                    isCarriedInSack = if (allowCarryOverwrite) b.optBoolean("sack", p.isCarriedInSack) else p.isCarriedInSack,
+                                    isCarriedByBor = if (allowCarryOverwrite) b.optBoolean("carriedByBor", p.isCarriedByBor) else p.isCarriedByBor,
+                                    speedBoostTimer = maxOf(p.speedBoostTimer, if (boost) 0.35f else 0f),
+                                    stunTimer = maxOf(p.stunTimer, if (stun) 0.35f else 0f),
+                                    slowTimer = maxOf(p.slowTimer, if (slowed) 0.35f else 0f),
+                                    mamaSlowUsed = p.mamaSlowUsed || b.optBoolean("slowUsed", false)
+                                )
+                            } else p
+                        }
+                        val tasksArr = obj.optJSONArray("tasks")
+                        val updatedTasks = if (tasksArr != null && tasksArr.length() == latestWorld.tasks.size) {
+                            latestWorld.tasks.mapIndexed { idx, t ->
+                                val tObj = tasksArr.getJSONObject(idx)
+                                val comp = t.completed || tObj.optBoolean("c", false)
+                                t.copy(
+                                    progress = if (comp) 1f else maxOf(t.progress, tObj.optDouble("p", t.progress.toDouble()).toFloat()),
+                                    completed = comp
+                                )
+                            }
+                        } else latestWorld.tasks
+
+                        latestWorld = latestWorld.copy(
+                            timeRemainingSec = timeLeft,
+                            players = updatedPlayers,
+                            tasks = updatedTasks
+                        )
+                    }
                 }
 
                 "mama_slow" -> {

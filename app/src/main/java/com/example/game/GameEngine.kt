@@ -8,6 +8,7 @@ import com.example.ui.theme.CngEmerald
 import com.example.ui.theme.FairyCyan
 import com.example.ui.theme.MamaOrange
 import com.example.ui.theme.MarigoldGold
+import org.json.JSONObject
 import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.atan2
@@ -29,7 +30,8 @@ class GameEngine(
     private val soundEngine: SoundEngine,
     private val onBotChat: (sender: PlayerEntity, text: String, channel: ChatChannel) -> Unit,
     private val onMatchFinished: (MatchResult) -> Unit,
-    private val onLocalChorCaughtBou: () -> Unit = {}
+    private val onLocalChorCaughtBou: () -> Unit = {},
+    private val onGameplayEvent: (eventType: String, payloadJson: String) -> Unit = { _, _ -> }
 ) {
     private var nextEffectId = 1L
     private var stats = MatchStatsTracker()
@@ -166,7 +168,8 @@ class GameEngine(
         ability2Pressed: Boolean,
         localMicLevel: Float,
         allowRandomWeatherTransition: Boolean = true,
-        ability3Pressed: Boolean = false
+        ability3Pressed: Boolean = false,
+        simulateBotsLocally: Boolean = true
     ): GameWorldState {
         val clampedDt = dt.coerceIn(0.001f, 0.05f)
         simFrameCount++
@@ -214,6 +217,15 @@ class GameEngine(
         fun setBanner(msg: String, duration: Float = 2.8f) {
             bannerText = msg
             bannerTimer = duration
+        }
+
+        fun emitEv(ev: String, block: JSONObject.() -> Unit = {}) {
+            val obj = JSONObject().apply {
+                put("type", "game_event")
+                put("ev", ev)
+                block()
+            }
+            onGameplayEvent(ev, obj.toString())
         }
 
         // 0. Dynamic Outdoor Courtyard Weather Transitions (Clear Evening <-> Monsoon Rain <-> Foggy Night)
@@ -299,6 +311,9 @@ class GameEngine(
                     setBanner("BOU SCREAMED FROM THE SACK! FOLLOW THE RED ARROW!")
                     cameraShake = 0.4f
                     if (p.isBot) triggerBotSpeech(players, i, "বাঁচাও! চোর ধরছে!", ChatChannel.ALL)
+                    if (p.isLocal || (p.isBot && simulateBotsLocally)) {
+                        emitEv("scream") { put("x", chor.pos.x.toDouble()); put("z", chor.pos.z.toDouble()) }
+                    }
                 }
                 continue
             }
@@ -324,13 +339,17 @@ class GameEngine(
                         players[i] = players[i].copy(isCarriedByBor = false, pos = hopPos)
                         players[borIdx] = bor.copy(isCarryingBou = false, holdType = HoldActionType.NONE, holdProgress = 0f)
                         addCombatText("HOPPED DOWN!", hopPos, MarigoldGold)
+                        emitEv("bou_hop_off") {
+                            put("bouId", p.id); put("borId", bor.id)
+                            put("hopX", hopPos.x.toDouble()); put("hopZ", hopPos.z.toDouble())
+                        }
                     }
                     continue
                 }
             }
 
-            if (!p.isLocal && !p.isBot) {
-                // Remote human players are driven directly by network position packets
+            if (!p.isLocal && (!p.isBot || !simulateBotsLocally)) {
+                // Remote human players (and Guest's remote bots) are driven directly by network sync
                 continue
             }
 
@@ -489,6 +508,7 @@ class GameEngine(
             val cur = players[i]
             when (cur.role) {
                 Role.BOU -> {
+                    val triggerEvent = cur.isLocal || (cur.isBot && simulateBotsLocally)
                     if (input.triggerAbility1 && cur.ability1Cooldown <= 0f) {
                         players[i] = cur.copy(ability1Cooldown = 10f, ability1MaxCooldown = 10f)
                         shockwaves.add(ShockwaveEffect(nextEffectId++, cur.pos))
@@ -497,32 +517,56 @@ class GameEngine(
                         addCombatText("PACHAO!!", cur.pos, BridalCrimson)
                         setBanner("BOU SCREAMED! FOLLOW THE RED ARROW!")
                         cameraShake = 0.3f
+                        if (triggerEvent) {
+                            emitEv("scream") { put("x", cur.pos.x.toDouble()); put("z", cur.pos.z.toDouble()) }
+                        }
                     }
                     if (input.triggerAbility2 && players[i].ability2Cooldown <= 0f) {
-                        players[i] = players[i].copy(ability2Cooldown = 6f, ability2MaxCooldown = 6f)
-                        val sx = sin(cur.yaw)
-                        val sz = cos(cur.yaw)
+                        val activeBou = players[i]
+                        val chorTarget = players[chorIdx]
+                        var throwYaw = activeBou.yaw
+                        if (activeBou.isLocal) {
+                            val dChor = activeBou.pos.dist2D(chorTarget.pos)
+                            val angChor = atan2(chorTarget.pos.x - activeBou.pos.x, chorTarget.pos.z - activeBou.pos.z)
+                            if (dChor <= 14.5f && abs(normalizeAngle(angChor - activeBou.yaw)) <= 1.55f && VenueMap.hasLineOfSight(activeBou.pos, chorTarget.pos)) {
+                                throwYaw = angChor
+                            }
+                        }
+                        players[i] = activeBou.copy(ability2Cooldown = 6f, ability2MaxCooldown = 6f, yaw = throwYaw)
+                        val sx = sin(throwYaw)
+                        val sz = cos(throwYaw)
+                        val px = activeBou.pos.x + sx * 0.9f
+                        val pz = activeBou.pos.z + sz * 0.9f
                         sandals.add(
                             SandalProjectile(
                                 id = nextEffectId++,
-                                ownerId = cur.id,
-                                pos = Vec3(cur.pos.x + sx * 0.9f, 1.15f, cur.pos.z + sz * 0.9f),
+                                ownerId = activeBou.id,
+                                pos = Vec3(px, 1.15f, pz),
                                 vx = sx * 21f,
                                 vz = sz * 21f
                             )
                         )
                         soundEngine.playSandalThrow()
-                        addCombatText("SANDAL!", cur.pos, MarigoldGold)
+                        addCombatText("SANDAL!", activeBou.pos, MarigoldGold)
+                        if (triggerEvent) {
+                            emitEv("sandal_throw") {
+                                put("ownerId", activeBou.id)
+                                put("x", px.toDouble()); put("z", pz.toDouble())
+                                put("vx", (sx * 21f).toDouble()); put("vz", (sz * 21f).toDouble())
+                            }
+                        }
                     }
                 }
 
                 Role.BOU_CHOR -> {
+                    val triggerEvent = cur.isLocal || (cur.isBot && simulateBotsLocally)
                     val bou = players[bouIdx]
                     val distToBou = cur.pos.dist2D(bou.pos)
-                    val nearGate = if (cur.isCarryingBou) world.gates.firstOrNull { cur.pos.dist2D(it.pos) <= it.radius } else null
+                    val escapePad = if (cur.holdType == HoldActionType.ESCAPE) 0.6f else 0f
+                    val nearGate = if (cur.isCarryingBou) world.gates.firstOrNull { cur.pos.dist2D(it.pos) <= it.radius + escapePad } else null
 
-                    // Ability 1: Speed Dash / Shotkan (Triggered when input.triggerAbility1 is pressed, or when holdAction pressed away from Bou/Gate)
-                    val isNearKidnapTarget = !cur.isCarryingBou && distToBou <= 3.8f && bou.kidnapImmunityTimer <= 0f
+                    val kidnapRange = if (cur.holdType == HoldActionType.KIDNAP) 5.4f else 4.2f
+                    val isNearKidnapTarget = !cur.isCarryingBou && distToBou <= kidnapRange && bou.kidnapImmunityTimer <= 0f
                     val isNearEscapeTarget = cur.isCarryingBou && nearGate != null
                     val wantsDash = input.triggerAbility1 || (input.holdAction && !isNearKidnapTarget && !isNearEscapeTarget)
 
@@ -542,10 +586,17 @@ class GameEngine(
                         }
                     }
 
-                    val updatedCur = players[i]
+                    var updatedCur = players[i]
 
                     if (!updatedCur.isCarryingBou) {
                         if (input.holdAction && isNearKidnapTarget) {
+                            // Subtle lunge assist while stationary human holds KIDNAP so Bou doesn't slip 0.2m out of range
+                            if (updatedCur.isLocal && mag < 0.25f && distToBou > 1.85f) {
+                                val lx = (bou.pos.x - updatedCur.pos.x) / distToBou
+                                val lz = (bou.pos.z - updatedCur.pos.z) / distToBou
+                                val stepPos = VenueMap.resolveMovement(Vec3(updatedCur.pos.x + lx * clampedDt * 5.0f, 0f, updatedCur.pos.z + lz * clampedDt * 5.0f))
+                                updatedCur = updatedCur.copy(pos = stepPos, yaw = atan2(lx, lz))
+                            }
                             val prev = if (updatedCur.holdType == HoldActionType.KIDNAP) updatedCur.holdProgress else 0f
                             val nextProg = (prev + clampedDt / 1.3f).coerceAtMost(1f)
                             tickCapturePulse(clampedDt)
@@ -570,6 +621,9 @@ class GameEngine(
                                 setBanner("CHOR KIDNAPPED BOU! BLOCK THE 3 ESCAPE GATES!", 3.8f)
                                 cameraShake = 0.55f
                                 if (bou.isBot) triggerBotSpeech(players, bouIdx, "বাঁচাও! চোর ধরছে!", ChatChannel.ALL)
+                                if (triggerEvent) {
+                                    emitEv("kidnap_bou") { put("chorId", updatedCur.id); put("bouId", bou.id) }
+                                }
                             } else {
                                 players[i] = updatedCur.copy(holdType = HoldActionType.KIDNAP, holdProgress = nextProg)
                             }
@@ -598,13 +652,22 @@ class GameEngine(
                         val cx = cos(activeChor.yaw)
                         val cz = -sin(activeChor.yaw)
 
-                        // Drop 2 banana peels side-by-side behind Chor
-                        bananas.add(BananaPeel(nextEffectId++, Vec3(activeChor.pos.x - sx * 1.2f + cx * 0.7f, 0.05f, activeChor.pos.z - sz * 1.2f + cz * 0.7f)))
-                        bananas.add(BananaPeel(nextEffectId++, Vec3(activeChor.pos.x - sx * 1.2f - cx * 0.7f, 0.05f, activeChor.pos.z - sz * 1.2f - cz * 0.7f)))
+                        val p1x = activeChor.pos.x - sx * 1.2f + cx * 0.7f
+                        val p1z = activeChor.pos.z - sz * 1.2f + cz * 0.7f
+                        val p2x = activeChor.pos.x - sx * 1.2f - cx * 0.7f
+                        val p2z = activeChor.pos.z - sz * 1.2f - cz * 0.7f
+                        bananas.add(BananaPeel(nextEffectId++, Vec3(p1x, 0.05f, p1z)))
+                        bananas.add(BananaPeel(nextEffectId++, Vec3(p2x, 0.05f, p2z)))
 
                         players[i] = activeChor.copy(ability2Cooldown = 4.0f, ability2MaxCooldown = 4.0f)
                         soundEngine.playChatPop()
                         addCombatText("DOUBLE BANANA!", activeChor.pos, MarigoldGold)
+                        if (triggerEvent) {
+                            emitEv("banana_drop") {
+                                put("x1", p1x.toDouble()); put("z1", p1z.toDouble())
+                                put("x2", p2x.toDouble()); put("z2", p2z.toDouble())
+                            }
+                        }
                     }
 
                     // Ability 3 (Once per entire match): Slow Mama's speed for 5 seconds!
@@ -618,17 +681,24 @@ class GameEngine(
                         }
                         soundEngine.playBananaSlip()
                         setBanner("CHOR CURSED MAMA! 55% SLOWER FOR 5s (1x USED)!", 3.0f)
+                        if (triggerEvent) {
+                            emitEv("chor_slow_mama") { put("chorId", players[i].id) }
+                        }
                     }
                 }
 
                 Role.BOR -> {
+                    val triggerEvent = cur.isLocal || (cur.isBot && simulateBotsLocally)
                     val chor = players[chorIdx]
                     val bou = players[bouIdx]
                     val distToChor = cur.pos.dist2D(chor.pos)
                     val distToBou = cur.pos.dist2D(bou.pos)
-                    val nearGate = if (cur.isCarryingBou) world.gates.firstOrNull { cur.pos.dist2D(it.pos) <= it.radius } else null
+                    val bidayiPad = if (cur.holdType == HoldActionType.BOR_ESCAPE) 0.6f else 0f
+                    val nearGate = if (cur.isCarryingBou) world.gates.firstOrNull { cur.pos.dist2D(it.pos) <= it.radius + bidayiPad } else null
+                    val rescueRange = if (cur.holdType == HoldActionType.RESCUE) 5.4f else 4.2f
+                    val pickupRange = if (cur.holdType == HoldActionType.PICKUP_BOU) 5.4f else 4.2f
 
-                    if (input.holdAction && chor.isCarryingBou && distToChor <= 3.6f) {
+                    if (input.holdAction && chor.isCarryingBou && distToChor <= rescueRange) {
                         val prev = if (cur.holdType == HoldActionType.RESCUE) cur.holdProgress else 0f
                         val nextProg = (prev + clampedDt / 1.5f).coerceAtMost(1f)
                         tickCapturePulse(clampedDt)
@@ -658,6 +728,12 @@ class GameEngine(
                             addCombatText("BOU RESCUED!", cur.pos, CngEmerald)
                             setBanner("BOR RESCUED BOU FROM CHOR'S SACK!", 2.8f)
                             cameraShake = 0.4f
+                            if (triggerEvent) {
+                                emitEv("rescue_bou") {
+                                    put("borId", cur.id); put("chorId", chor.id); put("bouId", bou.id)
+                                    put("freedX", freedPos.x.toDouble()); put("freedZ", freedPos.z.toDouble())
+                                }
+                            }
                         } else {
                             players[i] = cur.copy(holdType = HoldActionType.RESCUE, holdProgress = nextProg)
                         }
@@ -671,7 +747,7 @@ class GameEngine(
                             bidayiEscapedVia = nearGate.type
                         }
                         players[i] = cur.copy(holdType = HoldActionType.BOR_ESCAPE, holdProgress = nextProg)
-                    } else if (!cur.isCarryingBou && !chor.isCarryingBou && !bou.isCarriedInSack && !bou.isCarriedByBor && input.holdAction && distToBou <= 3.8f) {
+                    } else if (!cur.isCarryingBou && !chor.isCarryingBou && !bou.isCarriedInSack && !bou.isCarriedByBor && input.holdAction && distToBou <= pickupRange) {
                         // Scoop Bou into Jamai's arms (0.8s hold)
                         val prev = if (cur.holdType == HoldActionType.PICKUP_BOU) cur.holdProgress else 0f
                         val nextProg = (prev + clampedDt / 0.8f).coerceAtMost(1f)
@@ -682,6 +758,9 @@ class GameEngine(
                             soundEngine.playTaskComplete()
                             addCombatText("CARRYING BOU!", cur.pos, BorGold)
                             setBanner("JAMAI CARRYING BOU! SIT IN ANY VEHICLE FOR 3s TO WIN!", 3.4f)
+                            if (triggerEvent) {
+                                emitEv("bor_pickup_bou") { put("borId", cur.id); put("bouId", bou.id) }
+                            }
                         } else {
                             players[i] = cur.copy(holdType = HoldActionType.PICKUP_BOU, holdProgress = nextProg)
                         }
@@ -706,6 +785,9 @@ class GameEngine(
                             soundEngine.playTaskComplete()
                             addCombatText("JAMAI GUARD! +SHIELD", bou.pos, BorGold)
                             setBanner("JAMAI ESCORTING BOU! SHIELD + COUPLE SPEED BOOST!", 2.6f)
+                            if (triggerEvent) {
+                                emitEv("bor_guard") { put("borId", activeBor.id); put("bouId", bou.id) }
+                            }
                         } else {
                             players[i] = activeBor.copy(
                                 speedBoostTimer = 2.6f,
@@ -719,19 +801,25 @@ class GameEngine(
                 }
 
                 Role.MAMA -> {
+                    val triggerEvent = cur.isLocal || (cur.isBot && simulateBotsLocally)
                     if (input.triggerAbility1 && cur.ability1Cooldown <= 0f) {
-                        players[i] = cur.copy(ability1Cooldown = 4.5f, ability1MaxCooldown = 4.5f, swingAnim = 1.0f)
                         val chor = players[chorIdx]
                         val dist = cur.pos.dist2D(chor.pos)
                         val toChorAngle = atan2(chor.pos.x - cur.pos.x, chor.pos.z - cur.pos.z)
                         val angleDiff = abs(normalizeAngle(toChorAngle - cur.yaw))
-                        if (dist <= 4.3f && angleDiff <= 1.35f) {
+                        val hitDist = if (cur.isLocal) 4.6f else 4.3f
+                        val hitCone = if (cur.isLocal) (if (dist <= 3.6f) 2.35f else 1.75f) else 1.35f
+                        val landedHit = dist <= hitDist && angleDiff <= hitCone
+                        val swingYaw = if (cur.isLocal && landedHit) toChorAngle else cur.yaw
+                        players[i] = cur.copy(ability1Cooldown = 4.5f, ability1MaxCooldown = 4.5f, swingAnim = 1.0f, yaw = swingYaw)
+                        if (landedHit) {
                             stats.bambooHits++
                             val droppedBou = chor.isCarryingBou
+                            var dropPos = cur.pos
                             if (droppedBou) {
                                 stats.bambooDropSaves++
-                                val dropPos = VenueMap.resolveMovement(
-                                    Vec3(chor.pos.x - sin(cur.yaw) * 1.6f, 0f, chor.pos.z - cos(cur.yaw) * 1.6f)
+                                dropPos = VenueMap.resolveMovement(
+                                    Vec3(chor.pos.x - sin(swingYaw) * 1.6f, 0f, chor.pos.z - cos(swingYaw) * 1.6f)
                                 )
                                 players[bouIdx] = players[bouIdx].copy(
                                     isCarriedInSack = false,
@@ -753,6 +841,13 @@ class GameEngine(
                                 2.8f
                             )
                             cameraShake = 0.95f
+                            if (triggerEvent) {
+                                emitEv("chor_hit") {
+                                    put("cause", "bonk"); put("stun", 3.0); put("blind", 0.0); put("wallHack", 0.0)
+                                    put("droppedBou", droppedBou)
+                                    put("dropX", dropPos.x.toDouble()); put("dropZ", dropPos.z.toDouble())
+                                }
+                            }
                         } else {
                             soundEngine.playBambooWhoosh()
                             addCombatText("WHOOSH!", cur.pos, MamaOrange)
@@ -761,20 +856,35 @@ class GameEngine(
                 }
 
                 Role.PHOTOGRAPHER -> {
+                    val triggerEvent = cur.isLocal || (cur.isBot && simulateBotsLocally)
                     if (input.triggerAbility1 && cur.ability1Cooldown <= 0f) {
-                        players[i] = cur.copy(ability1Cooldown = 9.0f, ability1MaxCooldown = 9.0f)
-                        flashCones.add(FlashConeEffect(nextEffectId++, cur.pos, cur.yaw))
-                        soundEngine.playCameraFlash()
                         val chor = players[chorIdx]
                         val dist = cur.pos.dist2D(chor.pos)
                         val toChor = atan2(chor.pos.x - cur.pos.x, chor.pos.z - cur.pos.z)
                         val diff = abs(normalizeAngle(toChor - cur.yaw))
-                        if (dist <= 15.0f && diff <= 0.68f && VenueMap.hasLineOfSight(cur.pos, chor.pos)) {
+                        val hasLos = VenueMap.hasLineOfSight(cur.pos, chor.pos)
+                        val hitFlash = dist <= 15.5f && hasLos && (if (cur.isLocal) (diff <= 0.92f || (dist <= 4.8f && diff <= 1.45f)) else diff <= 0.68f)
+                        val coneYaw = if (cur.isLocal && hitFlash) toChor else cur.yaw
+                        players[i] = cur.copy(ability1Cooldown = 9.0f, ability1MaxCooldown = 9.0f, yaw = coneYaw)
+                        flashCones.add(FlashConeEffect(nextEffectId++, cur.pos, coneYaw))
+                        soundEngine.playCameraFlash()
+                        if (triggerEvent) {
+                            emitEv("flash_cone") {
+                                put("x", cur.pos.x.toDouble()); put("z", cur.pos.z.toDouble()); put("yaw", coneYaw.toDouble())
+                            }
+                        }
+                        if (hitFlash) {
                             stats.flashHits++
                             players[chorIdx] = chor.copy(blindTimer = 2.5f, wallHackTimer = 10.0f)
                             addCombatText("FLASHED!", chor.pos, FairyCyan)
                             setBanner("PHOTOGRAPHER FLASHED CHOR! REVEALED FOR 10s!", 3.2f)
                             cameraShake = 0.45f
+                            if (triggerEvent) {
+                                emitEv("chor_hit") {
+                                    put("cause", "flash"); put("stun", 0.0); put("blind", 2.5); put("wallHack", 10.0)
+                                    put("droppedBou", false)
+                                }
+                            }
                         } else {
                             addCombatText("CLICK!", cur.pos, FairyCyan)
                         }
@@ -819,6 +929,9 @@ class GameEngine(
                         val assistTag = if (jamaiAssisting) " (JAMAI ASSIST!)" else ""
                         addCombatText("${task.type.label.uppercase()} DONE!$assistTag", task.pos, MarigoldGold)
                         setBanner("BOU COMPLETED ${task.type.label.uppercase()}!", 2.4f)
+                        if (bou.isLocal || (bou.isBot && simulateBotsLocally)) {
+                            emitEv("task_done") { put("idx", ti); put("assist", jamaiAssisting) }
+                        }
                     }
                 }
             }
@@ -851,6 +964,13 @@ class GameEngine(
                 addCombatText("SANDAL STUN! 1.5s", chor.pos, BridalCrimson)
                 setBanner("BOU HIT CHOR WITH A HIGH-HEEL SANDAL!", 2.5f)
                 cameraShake = 0.45f
+                val bouOwner = players[bouIdx]
+                if (bouOwner.isLocal || (bouOwner.isBot && simulateBotsLocally)) {
+                    emitEv("chor_hit") {
+                        put("cause", "sandal"); put("stun", 1.5); put("blind", 0.0); put("wallHack", 0.0)
+                        put("droppedBou", false)
+                    }
+                }
                 sandalIter.remove()
             } else if (nextLife <= 0f || VenueMap.hitsObstacle(nx, nz, 0.25f)) {
                 sandalIter.remove()
@@ -870,8 +990,9 @@ class GameEngine(
                 if (p.role != Role.BOU_CHOR && !p.isCarriedInSack && !p.isCarriedByBor && !p.isIncapacitated) {
                     if (p.pos.dist2D(b.pos) <= 1.25f) {
                         val droppedByBor = p.role == Role.BOR && p.isCarryingBou
+                        var dropPos = p.pos
                         if (droppedByBor) {
-                            val dropPos = VenueMap.resolveMovement(Vec3(p.pos.x + 1.2f, 0f, p.pos.z))
+                            dropPos = VenueMap.resolveMovement(Vec3(p.pos.x + 1.2f, 0f, p.pos.z))
                             players[bouIdx] = players[bouIdx].copy(isCarriedByBor = false, pos = dropPos, kidnapImmunityTimer = 1.4f)
                             addCombatText("DROPPED BOU!", dropPos, MarigoldGold)
                         }
@@ -884,6 +1005,14 @@ class GameEngine(
                         stats.bananaSlips++
                         soundEngine.playBananaSlip()
                         addCombatText("SLIPPED!!", p.pos, MarigoldGold)
+                        if (p.isLocal || (p.isBot && simulateBotsLocally)) {
+                            emitEv("banana_slip") {
+                                put("victimId", p.id)
+                                put("bx", b.pos.x.toDouble()); put("bz", b.pos.z.toDouble())
+                                put("droppedByBor", droppedByBor)
+                                put("dropX", dropPos.x.toDouble()); put("dropZ", dropPos.z.toDouble())
+                            }
+                        }
                         triggered = true
                         break
                     }
@@ -1032,16 +1161,34 @@ class GameEngine(
 
         // 9. Match End Conditions
         if (bidayiEscapedVia != null) {
+            emitEv("match_end") {
+                put("team", Team.WEDDING.name)
+                put("via", bidayiEscapedVia!!.name)
+                put("jamai", true)
+                put("time", newTimeLeft.toDouble())
+            }
             val result = buildMatchResult(Team.WEDDING, bidayiEscapedVia, newTimeLeft, players, jamaiBidayiWin = true)
             val localWon = players.firstOrNull { it.isLocal }?.role?.team == Team.WEDDING
             if (localWon) soundEngine.playVictoryFanfare() else soundEngine.playDefeatFanfare()
             onMatchFinished(result)
         } else if (escapedVia != null) {
+            emitEv("match_end") {
+                put("team", Team.THIEF.name)
+                put("via", escapedVia!!.name)
+                put("jamai", false)
+                put("time", newTimeLeft.toDouble())
+            }
             val result = buildMatchResult(Team.THIEF, escapedVia, newTimeLeft, players)
             val localWon = players.firstOrNull { it.isLocal }?.role?.team == Team.THIEF
             if (localWon) soundEngine.playVictoryFanfare() else soundEngine.playDefeatFanfare()
             onMatchFinished(result)
-        } else if (newTimeLeft <= 0f) {
+        } else if (newTimeLeft <= 0f && simulateBotsLocally) {
+            emitEv("match_end") {
+                put("team", Team.WEDDING.name)
+                put("via", "")
+                put("jamai", false)
+                put("time", 0.0)
+            }
             val result = buildMatchResult(Team.WEDDING, null, 0f, players)
             val localWon = players.firstOrNull { it.isLocal }?.role?.team == Team.WEDDING
             if (localWon) soundEngine.playVictoryFanfare() else soundEngine.playDefeatFanfare()
@@ -1049,6 +1196,262 @@ class GameEngine(
         }
 
         return nextWorld
+    }
+
+    fun applyRemoteGameplayEvent(world: GameWorldState, obj: JSONObject): GameWorldState {
+        val ev = obj.optString("ev")
+        val players = world.players.toMutableList()
+        val tasks = world.tasks.toMutableList()
+        val sandals = world.sandals.toMutableList()
+        val bananas = world.bananas.toMutableList()
+        val shockwaves = world.shockwaves.toMutableList()
+        val flashCones = world.flashCones.toMutableList()
+        val combatTexts = world.combatTexts.toMutableList()
+        var screamBeacon = world.screamBeacon
+        var bannerText = world.bannerAlertText
+        var bannerTimer = world.bannerAlertTimer
+        var shake = world.cameraShake
+
+        val bouIdx = players.indexOfFirst { it.role == Role.BOU }
+        val chorIdx = players.indexOfFirst { it.role == Role.BOU_CHOR }
+        val borIdx = players.indexOfFirst { it.role == Role.BOR }
+        val mamaIdx = players.indexOfFirst { it.role == Role.MAMA }
+
+        fun addCt(text: String, pos: Vec3, col: Color) {
+            combatTexts.add(FloatingCombatText(nextEffectId++, text, Vec3(pos.x, pos.y + 2.7f, pos.z), col))
+        }
+
+        when (ev) {
+            "scream" -> {
+                val p = Vec3(obj.optDouble("x", 0.0).toFloat(), 0f, obj.optDouble("z", 0.0).toFloat())
+                shockwaves.add(ShockwaveEffect(nextEffectId++, p))
+                screamBeacon = ScreamBeacon(p, 7.0f)
+                soundEngine.playScream()
+                addCt("PACHAO!!", p, BridalCrimson)
+                bannerText = "BOU SCREAMED! FOLLOW THE RED ARROW!"
+                bannerTimer = 2.8f
+                shake = 0.35f
+            }
+
+            "sandal_throw" -> {
+                sandals.add(
+                    SandalProjectile(
+                        id = nextEffectId++,
+                        ownerId = obj.optString("ownerId", ""),
+                        pos = Vec3(obj.optDouble("x", 0.0).toFloat(), 1.15f, obj.optDouble("z", 0.0).toFloat()),
+                        vx = obj.optDouble("vx", 0.0).toFloat(),
+                        vz = obj.optDouble("vz", 0.0).toFloat()
+                    )
+                )
+                soundEngine.playSandalThrow()
+            }
+
+            "banana_drop" -> {
+                bananas.add(BananaPeel(nextEffectId++, Vec3(obj.optDouble("x1", 0.0).toFloat(), 0.05f, obj.optDouble("z1", 0.0).toFloat())))
+                bananas.add(BananaPeel(nextEffectId++, Vec3(obj.optDouble("x2", 0.0).toFloat(), 0.05f, obj.optDouble("z2", 0.0).toFloat())))
+                soundEngine.playChatPop()
+            }
+
+            "banana_slip" -> {
+                val vid = obj.optString("victimId", "")
+                val droppedByBor = obj.optBoolean("droppedByBor", false)
+                val vIdx = players.indexOfFirst { it.id == vid }
+                if (vIdx >= 0) {
+                    val vp = players[vIdx]
+                    players[vIdx] = vp.copy(slipTimer = 2.2f, isCarryingBou = if (droppedByBor) false else vp.isCarryingBou, holdType = HoldActionType.NONE, holdProgress = 0f)
+                    addCt("SLIPPED!!", vp.pos, MarigoldGold)
+                }
+                if (droppedByBor && bouIdx >= 0) {
+                    val dp = Vec3(obj.optDouble("dropX", 0.0).toFloat(), 0f, obj.optDouble("dropZ", 0.0).toFloat())
+                    players[bouIdx] = players[bouIdx].copy(isCarriedByBor = false, pos = dp, kidnapImmunityTimer = 1.4f)
+                    addCt("DROPPED BOU!", dp, MarigoldGold)
+                }
+                val bx = obj.optDouble("bx", 0.0).toFloat()
+                val bz = obj.optDouble("bz", 0.0).toFloat()
+                val bi = bananas.indexOfFirst { hypot(it.pos.x - bx, it.pos.z - bz) < 1.5f }
+                if (bi >= 0) bananas.removeAt(bi)
+                soundEngine.playBananaSlip()
+            }
+
+            "chor_slow_mama" -> {
+                soundEngine.playBananaSlip()
+                if (chorIdx >= 0) players[chorIdx] = players[chorIdx].copy(mamaSlowUsed = true)
+                if (mamaIdx >= 0) {
+                    players[mamaIdx] = players[mamaIdx].copy(slowTimer = 5.0f)
+                    shockwaves.add(ShockwaveEffect(nextEffectId++, players[mamaIdx].pos))
+                    addCt("SLOWED 5s!", players[mamaIdx].pos, Color(0xFFB388FF))
+                }
+                bannerText = "CHOR CURSED MAMA! 55% SLOWER FOR 5s (1x USED)!"
+                bannerTimer = 3.0f
+            }
+
+            "kidnap_bou" -> {
+                if (borIdx >= 0 && players[borIdx].isCarryingBou) {
+                    players[borIdx] = players[borIdx].copy(isCarryingBou = false, holdType = HoldActionType.NONE, holdProgress = 0f)
+                }
+                if (chorIdx >= 0) {
+                    players[chorIdx] = players[chorIdx].copy(isCarryingBou = true, holdType = HoldActionType.NONE, holdProgress = 0f)
+                    screamBeacon = ScreamBeacon(players[chorIdx].pos, 8.0f)
+                    addCt("SACKED BOU!", players[chorIdx].pos, BridalCrimson)
+                }
+                if (bouIdx >= 0) {
+                    players[bouIdx] = players[bouIdx].copy(isCarriedInSack = true, isCarriedByBor = false, auraExposed = false, campTimer = 0f)
+                }
+                soundEngine.playScream()
+                bannerText = "CHOR KIDNAPPED BOU! BLOCK THE 3 ESCAPE GATES!"
+                bannerTimer = 3.8f
+                shake = 0.55f
+            }
+
+            "rescue_bou" -> {
+                val freedPos = Vec3(obj.optDouble("freedX", 0.0).toFloat(), 0f, obj.optDouble("freedZ", 0.0).toFloat())
+                if (chorIdx >= 0) {
+                    players[chorIdx] = players[chorIdx].copy(
+                        isCarryingBou = false,
+                        stunTimer = maxOf(players[chorIdx].stunTimer, 1.3f),
+                        holdType = HoldActionType.NONE,
+                        holdProgress = 0f
+                    )
+                }
+                if (bouIdx >= 0) {
+                    players[bouIdx] = players[bouIdx].copy(
+                        isCarriedInSack = false,
+                        isCarriedByBor = false,
+                        pos = freedPos,
+                        kidnapImmunityTimer = 2.5f
+                    )
+                }
+                soundEngine.playTaskComplete()
+                addCt("BOU RESCUED!", freedPos, CngEmerald)
+                bannerText = "BOR RESCUED BOU FROM CHOR'S SACK!"
+                bannerTimer = 2.8f
+            }
+
+            "bor_pickup_bou" -> {
+                if (borIdx >= 0) {
+                    players[borIdx] = players[borIdx].copy(isCarryingBou = true, holdType = HoldActionType.NONE, holdProgress = 0f)
+                    addCt("CARRYING BOU!", players[borIdx].pos, BorGold)
+                }
+                if (bouIdx >= 0) {
+                    players[bouIdx] = players[bouIdx].copy(isCarriedByBor = true, isCarriedInSack = false, auraExposed = false, campTimer = 0f)
+                }
+                soundEngine.playTaskComplete()
+                bannerText = "JAMAI CARRYING BOU! SIT IN ANY VEHICLE FOR 3s TO WIN!"
+                bannerTimer = 3.4f
+            }
+
+            "bou_hop_off" -> {
+                val hp = Vec3(obj.optDouble("hopX", 0.0).toFloat(), 0f, obj.optDouble("hopZ", 0.0).toFloat())
+                if (bouIdx >= 0) {
+                    players[bouIdx] = players[bouIdx].copy(isCarriedByBor = false, pos = hp)
+                    addCt("HOPPED DOWN!", hp, MarigoldGold)
+                }
+                if (borIdx >= 0) {
+                    players[borIdx] = players[borIdx].copy(isCarryingBou = false, holdType = HoldActionType.NONE, holdProgress = 0f)
+                }
+            }
+
+            "bor_guard" -> {
+                if (borIdx >= 0) players[borIdx] = players[borIdx].copy(speedBoostTimer = maxOf(players[borIdx].speedBoostTimer, 3.5f))
+                if (bouIdx >= 0) {
+                    players[bouIdx] = players[bouIdx].copy(
+                        speedBoostTimer = maxOf(players[bouIdx].speedBoostTimer, 3.5f),
+                        kidnapImmunityTimer = maxOf(players[bouIdx].kidnapImmunityTimer, 4.0f)
+                    )
+                    shockwaves.add(ShockwaveEffect(nextEffectId++, players[bouIdx].pos))
+                    addCt("JAMAI GUARD! +SHIELD", players[bouIdx].pos, BorGold)
+                }
+                soundEngine.playTaskComplete()
+                bannerText = "JAMAI ESCORTING BOU! SHIELD + COUPLE SPEED BOOST!"
+                bannerTimer = 2.6f
+            }
+
+            "flash_cone" -> {
+                val p = Vec3(obj.optDouble("x", 0.0).toFloat(), 0f, obj.optDouble("z", 0.0).toFloat())
+                flashCones.add(FlashConeEffect(nextEffectId++, p, obj.optDouble("yaw", 0.0).toFloat()))
+                soundEngine.playCameraFlash()
+            }
+
+            "chor_hit" -> {
+                val cause = obj.optString("cause", "bonk")
+                val stun = obj.optDouble("stun", 0.0).toFloat()
+                val blind = obj.optDouble("blind", 0.0).toFloat()
+                val wallHack = obj.optDouble("wallHack", 0.0).toFloat()
+                val dropped = obj.optBoolean("droppedBou", false)
+                if (chorIdx >= 0) {
+                    val c = players[chorIdx]
+                    players[chorIdx] = c.copy(
+                        stunTimer = if (stun > 0f) maxOf(c.stunTimer, stun) else c.stunTimer,
+                        blindTimer = if (blind > 0f) maxOf(c.blindTimer, blind) else c.blindTimer,
+                        wallHackTimer = if (wallHack > 0f) maxOf(c.wallHackTimer, wallHack) else c.wallHackTimer,
+                        isCarryingBou = if (dropped) false else c.isCarryingBou,
+                        holdType = HoldActionType.NONE,
+                        holdProgress = 0f
+                    )
+                    when (cause) {
+                        "bonk" -> {
+                            soundEngine.playBonk()
+                            addCt("DHISHUM!! BONK!", c.pos, MamaOrange)
+                            bannerText = if (dropped) "MAMA BONKED CHOR & DROPPED BOU!" else "DHISHUM! MAMA LANDED A BAMBOO HIT!"
+                            shake = 0.95f
+                        }
+                        "sandal" -> {
+                            soundEngine.playSandalHit()
+                            addCt("SANDAL STUN! 1.5s", c.pos, BridalCrimson)
+                            bannerText = "BOU HIT CHOR WITH A HIGH-HEEL SANDAL!"
+                            shake = 0.45f
+                        }
+                        "flash" -> {
+                            addCt("FLASHED!", c.pos, FairyCyan)
+                            bannerText = "PHOTOGRAPHER FLASHED CHOR! REVEALED FOR 10s!"
+                            shake = 0.45f
+                        }
+                    }
+                    bannerTimer = 3.0f
+                }
+                if (dropped && bouIdx >= 0) {
+                    val dp = Vec3(obj.optDouble("dropX", 0.0).toFloat(), 0f, obj.optDouble("dropZ", 0.0).toFloat())
+                    players[bouIdx] = players[bouIdx].copy(isCarriedInSack = false, pos = dp, kidnapImmunityTimer = 2.5f)
+                }
+            }
+
+            "task_done" -> {
+                val ti = obj.optInt("idx", -1)
+                if (ti in tasks.indices) {
+                    tasks[ti] = tasks[ti].copy(progress = 1f, completed = true)
+                    soundEngine.playTaskComplete()
+                    addCt("${tasks[ti].type.label.uppercase()} DONE!", tasks[ti].pos, MarigoldGold)
+                    bannerText = "BOU COMPLETED ${tasks[ti].type.label.uppercase()}!"
+                    bannerTimer = 2.4f
+                }
+            }
+
+            "match_end" -> {
+                val team = runCatching { Team.valueOf(obj.optString("team", Team.WEDDING.name)) }.getOrDefault(Team.WEDDING)
+                val viaStr = obj.optString("via", "")
+                val via = if (viaStr.isNotEmpty()) runCatching { VehicleType.valueOf(viaStr) }.getOrNull() else null
+                val jamaiWin = obj.optBoolean("jamai", false)
+                val rem = obj.optDouble("time", world.timeRemainingSec.toDouble()).toFloat()
+                val res = buildMatchResult(team, via, rem, players, jamaiBidayiWin = jamaiWin)
+                val localWon = players.firstOrNull { it.isLocal }?.role?.team == team
+                if (localWon) soundEngine.playVictoryFanfare() else soundEngine.playDefeatFanfare()
+                onMatchFinished(res)
+            }
+        }
+
+        return world.copy(
+            players = players,
+            tasks = tasks,
+            sandals = sandals,
+            bananas = bananas,
+            shockwaves = shockwaves,
+            screamBeacon = screamBeacon,
+            flashCones = flashCones,
+            combatTexts = combatTexts,
+            cameraShake = shake,
+            bannerAlertText = bannerText,
+            bannerAlertTimer = bannerTimer
+        )
     }
 
     /**

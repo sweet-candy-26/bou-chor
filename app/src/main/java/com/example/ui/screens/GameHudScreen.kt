@@ -57,9 +57,11 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -451,13 +453,22 @@ fun GameHudScreen(
 
                         IconButton(
                             onClick = {
-                                if (!uiState.micPermissionGranted) onRequestMicPermission()
-                                onToggleMic()
+                                if (!uiState.micPermissionGranted) {
+                                    onRequestMicPermission()
+                                } else {
+                                    onToggleMic()
+                                }
                             },
                             modifier = Modifier
                                 .size(40.dp)
                                 .clip(CircleShape)
-                                .background(if (uiState.isMicEnabled) CngEmerald else BridalCrimson)
+                                .background(
+                                    when {
+                                        !uiState.micPermissionGranted -> MarigoldGold
+                                        uiState.isMicEnabled -> CngEmerald
+                                        else -> BridalCrimson
+                                    }
+                                )
                                 .border(
                                     width = if (uiState.localMicLevel > 0.18f) 2.5.dp else 1.5.dp,
                                     color = WarmIvory,
@@ -466,9 +477,9 @@ fun GameHudScreen(
                                 .testTag("hud_mic_toggle")
                         ) {
                             Icon(
-                                imageVector = if (uiState.isMicEnabled) Icons.Default.Mic else Icons.Default.MicOff,
+                                imageVector = if (uiState.micPermissionGranted && uiState.isMicEnabled) Icons.Default.Mic else Icons.Default.MicOff,
                                 contentDescription = "Toggle Microphone",
-                                tint = if (uiState.isMicEnabled) MaroonNight else WarmIvory,
+                                tint = if (!uiState.micPermissionGranted || uiState.isMicEnabled) MaroonNight else WarmIvory,
                                 modifier = Modifier.size(19.dp)
                             )
                         }
@@ -1088,8 +1099,12 @@ private fun computePrimaryButtonMeta(local: PlayerEntity, world: GameWorldState)
                     textColor = if (nearGate) MaroonNight else WarmIvory,
                     isHold = true
                 )
-            } else if (distBou <= 3.8f) {
-                PrimaryActionMeta("KIDNAP", "HOLD 1.3s", BridalCrimson, WarmIvory, true)
+            } else if (bou != null && distBou <= 4.2f) {
+                if (bou.kidnapImmunityTimer > 0f) {
+                    PrimaryActionMeta("SHIELDED", "DASH! [E]", MaroonCard, MarigoldGold, false)
+                } else {
+                    PrimaryActionMeta("KIDNAP", "HOLD 1.3s", BridalCrimson, WarmIvory, true)
+                }
             } else {
                 PrimaryActionMeta("DASH!", "SPEED BOOST", ChorCharcoal, WarmIvory, false)
             }
@@ -1109,9 +1124,9 @@ private fun computePrimaryButtonMeta(local: PlayerEntity, world: GameWorldState)
                         isHold = true
                     )
                 }
-                bou != null && !bou.isCarriedInSack && !bou.isCarriedByBor && local.pos.dist2D(bou.pos) <= 3.8f ->
+                bou != null && !bou.isCarriedInSack && !bou.isCarriedByBor && local.pos.dist2D(bou.pos) <= 4.2f ->
                     PrimaryActionMeta("CARRY BOU", "HOLD 0.8s", MarigoldGold, MaroonNight, true)
-                else -> PrimaryActionMeta("RESCUE", "HOLD 1.5s", CngEmerald, MaroonNight, true)
+                else -> PrimaryActionMeta("NEAR BOU", "GO TO BOU/CHOR", MaroonCard, MarigoldGold, true)
             }
         }
         Role.MAMA -> PrimaryActionMeta("BASH!", "DHISHUM!", MamaOrange, WarmIvory, false)
@@ -1205,6 +1220,18 @@ private fun TactileActionButton(
         (cooldown / maxCooldown).coerceIn(0f, 1f)
     } else 0f
 
+    val currentIsHold by rememberUpdatedState(isHoldButton)
+    val currentOnCooldown by rememberUpdatedState(onCooldown)
+    val currentEnabled by rememberUpdatedState(enabled)
+    val currentOnTap by rememberUpdatedState(onTap)
+    val currentOnHoldChanged by rememberUpdatedState(onHoldChanged)
+
+    DisposableEffect(Unit) {
+        onDispose {
+            if (currentIsHold) currentOnHoldChanged(false)
+        }
+    }
+
     Box(
         modifier = Modifier
             .size(sizeDp.dp)
@@ -1215,19 +1242,43 @@ private fun TactileActionButton(
                 color = if (inactive) WarmIvory.copy(alpha = 0.25f) else WarmIvory.copy(alpha = 0.88f),
                 shape = CircleShape
             )
-            .pointerInput(isHoldButton, onCooldown, enabled) {
-                detectTapGestures(
-                    onPress = {
-                        if (!enabled) return@detectTapGestures
-                        if (isHoldButton) {
-                            onHoldChanged(true)
-                            tryAwaitRelease()
-                            onHoldChanged(false)
-                        } else if (!onCooldown) {
-                            onTap()
+            .pointerInput(Unit) {
+                awaitPointerEventScope {
+                    var activePointerId: PointerId? = null
+                    var holding = false
+                    while (true) {
+                        val event = awaitPointerEvent()
+                        if (activePointerId == null) {
+                            val down = event.changes.firstOrNull { it.pressed && !it.isConsumed }
+                            if (down != null) {
+                                down.consume()
+                                if (currentEnabled) {
+                                    if (currentIsHold) {
+                                        activePointerId = down.id
+                                        holding = true
+                                        currentOnHoldChanged(true)
+                                    } else if (!currentOnCooldown) {
+                                        activePointerId = down.id
+                                        holding = false
+                                        currentOnTap()
+                                    }
+                                }
+                            }
+                        } else {
+                            val change = event.changes.firstOrNull { it.id == activePointerId }
+                            if (change == null || !change.pressed) {
+                                change?.consume()
+                                if (holding) {
+                                    holding = false
+                                    currentOnHoldChanged(false)
+                                }
+                                activePointerId = null
+                            } else {
+                                change.consume()
+                            }
                         }
                     }
-                )
+                }
             }
             .testTag(testTag),
         contentAlignment = Alignment.Center

@@ -4,9 +4,13 @@ import android.Manifest
 import android.annotation.SuppressLint
 import android.content.Context
 import android.content.pm.PackageManager
+import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioRecord
+import android.media.AudioTrack
 import android.media.MediaRecorder
+import android.media.audiofx.AcousticEchoCanceler
+import android.util.Base64
 import android.webkit.JavascriptInterface
 import android.webkit.PermissionRequest
 import android.webkit.WebChromeClient
@@ -50,12 +54,16 @@ import java.util.UUID
 import kotlin.math.sqrt
 
 /**
- * Real Android AudioRecord voice activity monitor.
- * Measures live microphone RMS energy (0f..1f) to drive Lobby Mic Check and HUD speaking glow.
+ * Real Android AudioRecord live voice capture & G.711 u-law encoder.
+ * Captures 8000 Hz Mono PCM-16 with AEC + automatic MIC fallback,
+ * drives Lobby/HUD mic meters, and streams compact VAD-gated u-law chunks.
  */
 class NativeMicMonitor(private val context: Context) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var monitorJob: Job? = null
+
+    @Volatile
+    var onEncodedVoiceFrame: ((String) -> Unit)? = null
 
     private val _micLevel = MutableStateFlow(0f)
     val micLevel: StateFlow<Float> = _micLevel.asStateFlow()
@@ -77,50 +85,89 @@ class NativeMicMonitor(private val context: Context) {
         if (monitorJob?.isActive == true) return
         _isMicActive.value = true
         monitorJob = scope.launch {
-            val sampleRate = 16000
+            val sampleRate = 8000
+            val frameSamples = 640 // 80ms per frame
             val minBuf = AudioRecord.getMinBufferSize(
                 sampleRate,
                 AudioFormat.CHANNEL_IN_MONO,
                 AudioFormat.ENCODING_PCM_16BIT
             )
-            if (minBuf <= 0) return@launch
+            if (minBuf <= 0) {
+                _isMicActive.value = false
+                return@launch
+            }
+            val bufBytes = maxOf(minBuf * 2, frameSamples * 4)
             var recorder: AudioRecord? = null
+            var aec: AcousticEchoCanceler? = null
             try {
-                recorder = AudioRecord(
-                    MediaRecorder.AudioSource.VOICE_COMMUNICATION,
-                    sampleRate,
-                    AudioFormat.CHANNEL_IN_MONO,
-                    AudioFormat.ENCODING_PCM_16BIT,
-                    minBuf * 2
-                )
-                if (recorder.state != AudioRecord.STATE_INITIALIZED) {
-                    recorder.release()
+                for (source in intArrayOf(MediaRecorder.AudioSource.VOICE_COMMUNICATION, MediaRecorder.AudioSource.MIC)) {
+                    val candidate = runCatching {
+                        AudioRecord(
+                            source,
+                            sampleRate,
+                            AudioFormat.CHANNEL_IN_MONO,
+                            AudioFormat.ENCODING_PCM_16BIT,
+                            bufBytes
+                        )
+                    }.getOrNull()
+                    if (candidate != null && candidate.state == AudioRecord.STATE_INITIALIZED) {
+                        val started = runCatching { candidate.startRecording(); true }.getOrDefault(false)
+                        if (started) {
+                            recorder = candidate
+                            break
+                        }
+                    }
+                    runCatching { candidate?.release() }
+                }
+                if (recorder == null) {
+                    _isMicActive.value = false
                     return@launch
                 }
-                recorder.startRecording()
-                val buffer = ShortArray(minBuf / 2)
+                runCatching {
+                    if (AcousticEchoCanceler.isAvailable()) {
+                        aec = AcousticEchoCanceler.create(recorder.audioSessionId)?.apply { enabled = true }
+                    }
+                }
+                val buffer = ShortArray(frameSamples)
+                val uLawBytes = ByteArray(frameSamples)
+                var hangoverFrames = 0
                 while (isActive) {
-                    val read = recorder.read(buffer, 0, buffer.size)
-                    if (read > 0) {
+                    var offset = 0
+                    while (offset < frameSamples && isActive) {
+                        val read = recorder.read(buffer, offset, frameSamples - offset)
+                        if (read <= 0) break
+                        offset += read
+                    }
+                    if (offset > 0) {
                         var sumSq = 0.0
-                        for (i in 0 until read) {
+                        for (i in 0 until offset) {
                             val norm = buffer[i] / 32768.0
                             sumSq += norm * norm
                         }
-                        val rms = sqrt(sumSq / read).toFloat()
-                        val boosted = (rms * 7.5f).coerceIn(0f, 1f)
-                        _micLevel.value = _micLevel.value * 0.45f + boosted * 0.55f
+                        val rms = sqrt(sumSq / offset).toFloat()
+                        val boosted = (rms * 10.5f).coerceIn(0f, 1f)
+                        _micLevel.value = _micLevel.value * 0.42f + boosted * 0.58f
+
+                        val callback = onEncodedVoiceFrame
+                        if (callback != null && offset == frameSamples) {
+                            if (rms > 0.012f) hangoverFrames = 6
+                            if (hangoverFrames > 0) {
+                                hangoverFrames--
+                                encodeMuLawFrame(buffer, uLawBytes)
+                                val b64 = Base64.encodeToString(uLawBytes, Base64.NO_WRAP)
+                                callback(b64)
+                            }
+                        }
+                    } else {
+                        delay(40)
                     }
-                    delay(45)
                 }
             } catch (_: Throwable) {
                 _micLevel.value = 0f
             } finally {
-                try {
-                    recorder?.stop()
-                    recorder?.release()
-                } catch (_: Throwable) {
-                }
+                runCatching { aec?.release() }
+                runCatching { recorder?.stop() }
+                runCatching { recorder?.release() }
                 _micLevel.value = 0f
                 _isMicActive.value = false
             }
@@ -133,6 +180,42 @@ class NativeMicMonitor(private val context: Context) {
         _micLevel.value = 0f
         _isMicActive.value = false
     }
+}
+
+private fun encodeMuLawFrame(pcm: ShortArray, out: ByteArray) {
+    for (i in pcm.indices) {
+        var sample = pcm[i].toInt()
+        val sign = if (sample < 0) {
+            sample = -sample
+            0x80
+        } else {
+            0
+        }
+        if (sample > 32635) sample = 32635
+        sample += 0x84
+        var exponent = 7
+        var mask = 0x4000
+        while (exponent > 0 && (sample and mask) == 0) {
+            exponent--
+            mask = mask shr 1
+        }
+        val mantissa = (sample shr (exponent + 3)) and 0x0F
+        out[i] = (sign or (exponent shl 4) or mantissa).inv().toByte()
+    }
+}
+
+private fun decodeMuLawFrame(uLaw: ByteArray): ShortArray {
+    val out = ShortArray(uLaw.size)
+    for (i in uLaw.indices) {
+        val u = uLaw[i].toInt().inv() and 0xFF
+        val sign = u and 0x80
+        val exponent = (u and 0x70) shr 4
+        val mantissa = u and 0x0F
+        var sample = ((mantissa shl 3) + 0x84) shl exponent
+        sample -= 0x84
+        out[i] = (if (sign != 0) -sample else sample).coerceIn(-32768, 32767).toShort()
+    }
+    return out
 }
 
 interface PeerEventsListener {
@@ -479,12 +562,14 @@ class BouChorLanManager(
 
     private fun sendToSocket(s: Socket, data: String): Boolean {
         return try {
-            if (s.isConnected && !s.isClosed) {
-                val out = PrintWriter(OutputStreamWriter(s.getOutputStream()), true)
-                out.println(data)
-                true
-            } else {
-                false
+            synchronized(s) {
+                if (s.isConnected && !s.isClosed) {
+                    val out = PrintWriter(OutputStreamWriter(s.getOutputStream()), true)
+                    out.println(data)
+                    true
+                } else {
+                    false
+                }
             }
         } catch (_: Throwable) {
             false
@@ -568,6 +653,17 @@ class PeerBridgeController(
 
     @Volatile
     private var hasPrimaryConnection = false
+
+    @Volatile
+    private var nativeMicEnabled = true
+
+    @Volatile
+    private var nativeSpeakerMuted = false
+
+    private val voiceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val remotePeerGains = Collections.synchronizedMap(mutableMapOf<String, Float>())
+    private val remoteAudioTracks = Collections.synchronizedMap(mutableMapOf<String, AudioTrack>())
+    private var voiceSeq = 1L
 
     private val lanManager = BouChorLanManager(
         localPeerId = localPeerId,
@@ -656,13 +752,120 @@ class PeerBridgeController(
         evalJs("window.BouChorNet && window.BouChorNet.broadcast($quoted);")
     }
 
+    fun broadcastVoiceFrame(base64MuLaw: String) {
+        if (!nativeMicEnabled || activeRoomCode.isEmpty()) return
+        val pkt = JSONObject().apply {
+            put("type", "v")
+            put("senderId", localPeerId)
+            put("roomCode", activeRoomCode)
+            put("pktId", "${localPeerId}_v_${voiceSeq++}")
+            put("d", base64MuLaw)
+        }.toString()
+        lanManager.broadcast(pkt)
+        relayManager.publish(pkt)
+        val quoted = JSONObject.quote(pkt)
+        evalJs("window.BouChorNet && window.BouChorNet.broadcast($quoted);")
+    }
+
     fun setAudioControls(micOn: Boolean, speakerMuted: Boolean) {
+        nativeMicEnabled = micOn
+        nativeSpeakerMuted = speakerMuted
         evalJs("window.BouChorNet && window.BouChorNet.setAudio($micOn, $speakerMuted);")
     }
 
     fun updatePeerGain(peerId: String, gain: Float) {
+        val clamped = gain.coerceIn(0f, 1f)
+        remotePeerGains[peerId] = clamped
         val safePeer = JSONObject.quote(peerId)
-        evalJs("window.BouChorNet && window.BouChorNet.setPeerGain($safePeer, ${gain.coerceIn(0f, 1f)});")
+        evalJs("window.BouChorNet && window.BouChorNet.setPeerGain($safePeer, $clamped);")
+    }
+
+    private fun releaseRemoteTrack(peerId: String) {
+        remotePeerGains.remove(peerId)
+        val tr = remoteAudioTracks.remove(peerId) ?: return
+        runCatching { tr.stop() }
+        runCatching { tr.release() }
+    }
+
+    private fun releaseAllRemoteTracks() {
+        remotePeerGains.clear()
+        val snapshot = synchronized(remoteAudioTracks) {
+            val list = remoteAudioTracks.values.toList()
+            remoteAudioTracks.clear()
+            list
+        }
+        snapshot.forEach { tr ->
+            runCatching { tr.stop() }
+            runCatching { tr.release() }
+        }
+    }
+
+    private fun handleIncomingVoiceFrame(senderId: String, base64MuLaw: String) {
+        if (base64MuLaw.isEmpty()) return
+        voiceScope.launch {
+            try {
+                val uLaw = Base64.decode(base64MuLaw, Base64.DEFAULT)
+                if (uLaw.isEmpty()) return@launch
+                val pcm = decodeMuLawFrame(uLaw)
+                var sumSq = 0.0
+                for (i in pcm.indices) {
+                    val n = pcm[i] / 32768.0
+                    sumSq += n * n
+                }
+                val rms = sqrt(sumSq / pcm.size).toFloat()
+                val level = (rms * 10.5f).coerceIn(0f, 1f)
+                listener.onRemoteVoiceLevel(senderId, level)
+
+                val effectiveGain = if (nativeSpeakerMuted) 0f else (remotePeerGains[senderId] ?: 1f)
+                if (effectiveGain <= 0.01f) return@launch
+
+                for (i in pcm.indices) {
+                    val scaled = (pcm[i] * effectiveGain).toInt().coerceIn(-32768, 32767)
+                    pcm[i] = scaled.toShort()
+                }
+
+                val track = remoteAudioTracks[senderId] ?: synchronized(remoteAudioTracks) {
+                    remoteAudioTracks[senderId] ?: createVoiceAudioTrack().also {
+                        if (it != null) remoteAudioTracks[senderId] = it
+                    }
+                } ?: return@launch
+
+                if (track.playState != AudioTrack.PLAYSTATE_PLAYING) {
+                    runCatching { track.play() }
+                }
+                track.write(pcm, 0, pcm.size)
+            } catch (_: Throwable) {
+            }
+        }
+    }
+
+    private fun createVoiceAudioTrack(): AudioTrack? {
+        return runCatching {
+            val sampleRate = 8000
+            val minBuf = AudioTrack.getMinBufferSize(
+                sampleRate,
+                AudioFormat.CHANNEL_OUT_MONO,
+                AudioFormat.ENCODING_PCM_16BIT
+            )
+            if (minBuf <= 0) return null
+            AudioTrack.Builder()
+                .setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_MEDIA)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                        .build()
+                )
+                .setAudioFormat(
+                    AudioFormat.Builder()
+                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                        .setSampleRate(sampleRate)
+                        .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                        .build()
+                )
+                .setBufferSizeInBytes(maxOf(minBuf * 2, 3200))
+                .setTransferMode(AudioTrack.MODE_STREAM)
+                .build()
+        }.getOrNull()
     }
 
     fun disconnect() {
@@ -678,6 +881,7 @@ class PeerBridgeController(
         }
         hasPrimaryConnection = false
         activeRoomCode = ""
+        releaseAllRemoteTracks()
         lanManager.stopAll()
         relayManager.stopAll()
         evalJs("window.BouChorNet && window.BouChorNet.disconnect();")
@@ -749,7 +953,12 @@ class PeerBridgeController(
                 listener.onRemotePacket(senderId, rawPayload)
             }
 
+            "v" -> {
+                handleIncomingVoiceFrame(senderId, obj.optString("d", ""))
+            }
+
             "bye" -> {
+                releaseRemoteTrack(senderId)
                 listener.onRemotePeerLeft(senderId)
             }
 
@@ -998,12 +1207,11 @@ $peerJsContent
   }
 
   window.BouChorNet = {
-    createRoom: async function(code, name) {
+    createRoom: function(code, name) {
       this.disconnect();
       myName = name || 'Host';
       myRoomCode = (code || '').toUpperCase();
       if (!myRoomCode || myRoomCode.indexOf('.') >= 0 || typeof Peer === 'undefined') return;
-      await ensureAudioStream();
       try {
         const hostPeerId = 'bouchor-room-' + myRoomCode;
         peer = new Peer(hostPeerId, PEER_CONFIG);
@@ -1013,32 +1221,21 @@ $peerJsContent
         peer.on('connection', (conn) => {
           wireDataConn(conn, false);
         });
-        peer.on('call', (call) => {
-          call.answer(localStream || undefined);
-          mediaCalls[call.peer] = call;
-          call.on('stream', (rs) => attachRemoteStream(call.peer, rs));
-        });
         peer.on('error', () => {});
       } catch (e) {}
     },
 
-    joinRoom: async function(code, name) {
+    joinRoom: function(code, name) {
       this.disconnect();
       myName = name || 'Guest';
       myRoomCode = (code || '').toUpperCase();
       if (!myRoomCode || myRoomCode.indexOf('.') >= 0 || typeof Peer === 'undefined') return;
-      await ensureAudioStream();
       try {
         peer = new Peer(PEER_CONFIG);
         peer.on('open', () => {
           const hostId = 'bouchor-room-' + myRoomCode;
           const conn = peer.connect(hostId, { reliable: true, serialization: 'json' });
           wireDataConn(conn, true);
-        });
-        peer.on('call', (call) => {
-          call.answer(localStream || undefined);
-          mediaCalls[call.peer] = call;
-          call.on('stream', (rs) => attachRemoteStream(call.peer, rs));
         });
         peer.on('error', () => {});
       } catch (e) {}

@@ -130,17 +130,26 @@ fun LobbyScreen(
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 IconButton(
                     onClick = {
-                        if (!uiState.micPermissionGranted) onRequestMicPermission()
-                        onToggleMic()
+                        if (!uiState.micPermissionGranted) {
+                            onRequestMicPermission()
+                        } else {
+                            onToggleMic()
+                        }
                     },
                     modifier = Modifier
                         .size(44.dp)
                         .clip(CircleShape)
-                        .background(if (uiState.isMicEnabled) CngEmerald else BridalCrimson)
+                        .background(
+                            when {
+                                !uiState.micPermissionGranted -> MarigoldGold
+                                uiState.isMicEnabled -> CngEmerald
+                                else -> BridalCrimson
+                            }
+                        )
                         .testTag("lobby_mic_toggle")
                 ) {
                     Icon(
-                        if (uiState.isMicEnabled) Icons.Default.Mic else Icons.Default.MicOff,
+                        if (uiState.micPermissionGranted && uiState.isMicEnabled) Icons.Default.Mic else Icons.Default.MicOff,
                         contentDescription = "Toggle Microphone",
                         tint = MaroonNight
                     )
