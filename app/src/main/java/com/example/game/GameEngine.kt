@@ -2,6 +2,7 @@ package com.example.game
 
 import androidx.compose.ui.graphics.Color
 import com.example.audio.SoundEngine
+import com.example.ui.theme.BorGold
 import com.example.ui.theme.BridalCrimson
 import com.example.ui.theme.CngEmerald
 import com.example.ui.theme.FairyCyan
@@ -73,13 +74,7 @@ class GameEngine(
         simFrameCount = 0
         cachedSpringHitDist = 13.4f
 
-        val allRoles = Role.entries.toMutableList().apply { shuffle() }
         val localLobby = lobbyPlayers.firstOrNull { it.isLocal }
-        if (preferredLocalRole != null && localLobby != null) {
-            allRoles.remove(preferredLocalRole)
-            allRoles.add(0, preferredLocalRole)
-        }
-
         val botNames = listOf("Chacha Karim", "Bhabi Rina", "Kaku Jamal", "Mami Shilpi", "Babu Vai").shuffled()
         val finalRoster = mutableListOf<LobbyPlayer>()
         if (localLobby != null) finalRoster.add(localLobby)
@@ -101,8 +96,23 @@ class GameEngine(
         val preset = presetMultiplayerRoles
         presetMultiplayerRoles = null
 
+        val seenRoles = mutableSetOf<Role>()
+        val assignedPresetRoles = finalRoster.map { lp ->
+            val r = preset?.get(lp.id) ?: preset?.get(lp.name)
+            if (r != null && seenRoles.add(r)) r else null
+        }
+        val remainingRoles = Role.entries.toMutableList().apply {
+            removeAll(seenRoles)
+            shuffle()
+            if (preferredLocalRole != null && localLobby != null && assignedPresetRoles.firstOrNull() == null && contains(preferredLocalRole)) {
+                remove(preferredLocalRole)
+                add(0, preferredLocalRole)
+            }
+        }
+        var remIdx = 0
+
         val entities = finalRoster.mapIndexed { i, lp ->
-            val role = preset?.get(lp.id) ?: preset?.get(lp.name) ?: allRoles[i]
+            val role = assignedPresetRoles[i] ?: remainingRoles[remIdx++]
             val spawn = VenueMap.spawnPositionFor(role)
             // Always construct an independent Vec3 copy for every entity
             val uniquePos = Vec3(spawn.x, spawn.y, spawn.z)
@@ -286,6 +296,11 @@ class GameEngine(
                     cameraShake = 0.4f
                     if (p.isBot) triggerBotSpeech(players, i, "বাঁচাও! চোর ধরছে!", ChatChannel.ALL)
                 }
+                continue
+            }
+
+            if (!p.isLocal && !p.isBot) {
+                // Remote human players are driven directly by network position packets
                 continue
             }
 
@@ -548,7 +563,10 @@ class GameEngine(
 
                 Role.BOR -> {
                     val chor = players[chorIdx]
+                    val bou = players[bouIdx]
                     val distToChor = cur.pos.dist2D(chor.pos)
+                    val distToBou = cur.pos.dist2D(bou.pos)
+
                     if (input.holdAction && chor.isCarryingBou && distToChor <= 3.6f) {
                         val prev = if (cur.holdType == HoldActionType.RESCUE) cur.holdProgress else 0f
                         val nextProg = (prev + clampedDt / 1.5f).coerceAtMost(1f)
@@ -583,6 +601,34 @@ class GameEngine(
                         }
                     } else {
                         players[i] = cur.copy(holdType = HoldActionType.NONE, holdProgress = 0f)
+                    }
+
+                    // Ability 2: Jamai Guard / Couple Escort Sprint
+                    if (input.triggerAbility2 && players[i].ability2Cooldown <= 0f) {
+                        val activeBor = players[i]
+                        if (!bou.isCarriedInSack && distToBou <= 4.8f) {
+                            players[i] = activeBor.copy(
+                                speedBoostTimer = 3.5f,
+                                ability2Cooldown = 9.0f,
+                                ability2MaxCooldown = 9.0f
+                            )
+                            players[bouIdx] = players[bouIdx].copy(
+                                speedBoostTimer = maxOf(players[bouIdx].speedBoostTimer, 3.5f),
+                                kidnapImmunityTimer = maxOf(players[bouIdx].kidnapImmunityTimer, 4.0f)
+                            )
+                            shockwaves.add(ShockwaveEffect(nextEffectId++, bou.pos))
+                            soundEngine.playTaskComplete()
+                            addCombatText("JAMAI GUARD! +SHIELD", bou.pos, BorGold)
+                            setBanner("JAMAI ESCORTING BOU! SHIELD + COUPLE SPEED BOOST!", 2.6f)
+                        } else {
+                            players[i] = activeBor.copy(
+                                speedBoostTimer = 2.4f,
+                                ability2Cooldown = 9.0f,
+                                ability2MaxCooldown = 9.0f
+                            )
+                            soundEngine.playChatPop()
+                            addCombatText("JAMAI SPRINT!", activeBor.pos, BorGold)
+                        }
                     }
                 }
 
@@ -663,19 +709,23 @@ class GameEngine(
 
         // 3. Bou Multi-Zone Wedding Tasks & Anti-Camp Rule
         val bou = players[bouIdx]
+        val borPlayer = players.firstOrNull { it.role == Role.BOR }
+        val jamaiAssisting = borPlayer != null && !borPlayer.isIncapacitated && bou.pos.dist2D(borPlayer.pos) <= 4.5f
         if (!bou.isCarriedInSack) {
             var doingTask = false
             for (ti in tasks.indices) {
                 val task = tasks[ti]
                 if (!task.completed && bou.pos.dist2D(task.pos) <= task.radius) {
                     doingTask = true
-                    val nextProg = (task.progress + clampedDt / 4.2f).coerceAtMost(1f)
+                    val speedMult = if (jamaiAssisting) 1.6f else 1.0f
+                    val nextProg = (task.progress + (clampedDt * speedMult) / 4.2f).coerceAtMost(1f)
                     val justDone = nextProg >= 1f && !task.completed
                     tasks[ti] = task.copy(progress = nextProg, completed = nextProg >= 1f)
                     if (justDone) {
                         stats.bouTasksDone++
                         soundEngine.playTaskComplete()
-                        addCombatText("${task.type.label.uppercase()} DONE!", task.pos, MarigoldGold)
+                        val assistTag = if (jamaiAssisting) " (JAMAI ASSIST!)" else ""
+                        addCombatText("${task.type.label.uppercase()} DONE!$assistTag", task.pos, MarigoldGold)
                         setBanner("BOU COMPLETED ${task.type.label.uppercase()}!", 2.4f)
                     }
                 }
@@ -1101,7 +1151,10 @@ class GameEngine(
 
             Role.BOR -> {
                 val distChor = bot.pos.dist2D(chor.pos)
+                val distBou = bot.pos.dist2D(bou.pos)
+                val chorNearBou = chor.pos.dist2D(bou.pos) <= 13.0f
                 if (chor.isCarryingBou) {
+                    val sprintToRescue = distChor > 5.0f && bot.ability2Cooldown <= 0f
                     if (distChor <= 3.1f) {
                         val closeIn = if (distChor > 1.95f) 0.5f else 0f
                         PlayerActionInput(
@@ -1111,27 +1164,27 @@ class GameEngine(
                         )
                     } else {
                         steerToward(Vec3(chor.pos.x, 0f, chor.pos.z))
-                        PlayerActionInput(scratchSteerX, scratchSteerZ, holdAction = distChor <= 3.6f)
+                        PlayerActionInput(
+                            scratchSteerX,
+                            scratchSteerZ,
+                            holdAction = distChor <= 3.6f,
+                            triggerAbility2 = sprintToRescue
+                        )
                     }
                 } else {
-                    val seesChor = chor.wallHackTimer > 0f || distChor < 20f * visScale
-                    if (seesChor) {
-                        if (distChor <= 2.2f) {
-                            PlayerActionInput(0f, 0f)
-                        } else {
-                            steerToward(Vec3(chor.pos.x, 0f, chor.pos.z))
-                            PlayerActionInput(scratchSteerX, scratchSteerZ)
-                        }
+                    val guardNow = distBou <= 4.5f && chorNearBou && bot.ability2Cooldown <= 0f
+                    if (distBou > 4.0f) {
+                        steerToward(Vec3(bou.pos.x, 0f, bou.pos.z))
+                        val sprintToBou = distBou > 12f && chorNearBou && bot.ability2Cooldown <= 0f
+                        PlayerActionInput(scratchSteerX, scratchSteerZ, triggerAbility2 = sprintToBou)
+                    } else if (chorNearBou) {
+                        // Escort and guard Bou closely when Chor approaches
+                        steerToward(Vec3(bou.pos.x, 0f, bou.pos.z))
+                        PlayerActionInput(scratchSteerX * 0.5f, scratchSteerZ * 0.5f, triggerAbility2 = guardNow)
                     } else {
-                        val distBou = bot.pos.dist2D(bou.pos)
-                        if (distBou > 5.0f) {
-                            steerToward(Vec3(bou.pos.x, 0f, bou.pos.z))
-                            PlayerActionInput(scratchSteerX, scratchSteerZ)
-                        } else {
-                            // Keep escort distance around Bou instead of stacking on top of her
-                            steerToward(getOrPickWanderTarget(bot))
-                            PlayerActionInput(scratchSteerX * 0.65f, scratchSteerZ * 0.65f)
-                        }
+                        // Patrol gently around Bou while assisting tasks
+                        steerToward(getOrPickWanderTarget(bot))
+                        PlayerActionInput(scratchSteerX * 0.65f, scratchSteerZ * 0.65f, triggerAbility2 = guardNow)
                     }
                 }
             }

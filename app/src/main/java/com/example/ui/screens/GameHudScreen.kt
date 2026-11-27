@@ -923,12 +923,24 @@ fun GameHudScreen(
                     horizontalArrangement = Arrangement.spacedBy(12.dp),
                     verticalAlignment = Alignment.Bottom
                 ) {
-                    // Ability 2 (Sandal for Bou, Banana Peel for Bou Chor)
+                    // Ability 2 (Sandal for Bou, Banana Peel for Bou Chor, Guard/Sprint for Bor)
                     val a2Name = local.role.ability2Name
                     if (a2Name != null && !local.isCarriedInSack) {
+                        val bou = world.players.firstOrNull { it.role == Role.BOU }
+                        val borNearBou = local.role == Role.BOR && bou != null && !bou.isCarriedInSack && local.pos.dist2D(bou.pos) <= 4.8f
+                        val displayA2Label = when {
+                            local.role == Role.BOR && borNearBou -> "GUARD!"
+                            local.role == Role.BOR -> "SPRINT!"
+                            else -> a2Name
+                        }
+                        val displayA2Sub = when {
+                            local.role == Role.BOR && borNearBou -> "SHIELD+SPD"
+                            local.role == Role.BOR -> "TO BOU [F]"
+                            else -> "TAP [F]"
+                        }
                         TactileActionButton(
-                            label = a2Name,
-                            subLabel = "TAP [F]",
+                            label = displayA2Label,
+                            subLabel = displayA2Sub,
                             cooldown = local.ability2Cooldown,
                             maxCooldown = local.ability2MaxCooldown,
                             holdProgress = 0f,

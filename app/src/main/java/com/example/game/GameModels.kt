@@ -60,7 +60,7 @@ enum class Role(
         bengaliTitle = "Thief • বউ চোর",
         team = Team.THIEF,
         accentColor = ChorCharcoal,
-        baseSpeed = 9.8f,
+        baseSpeed = 10.7f,
         ability1Name = "DASH",
         ability2Name = "BANANA",
         shortGoal = "Dash (Sprint Boost), drop Bananas, Sack Bou (1.3s hold) & escape!"
@@ -73,8 +73,8 @@ enum class Role(
         accentColor = BorGold,
         baseSpeed = 10.1f,
         ability1Name = "RESCUE",
-        ability2Name = null,
-        shortGoal = "Sprint across the venue & hold Rescue (1.5s) to free Bou!"
+        ability2Name = "GUARD",
+        shortGoal = "Guard Bou (Speed+Shield), boost tasks 1.6x, or Rescue her from Chor!"
     ),
     MAMA(
         displayName = "MAMA",

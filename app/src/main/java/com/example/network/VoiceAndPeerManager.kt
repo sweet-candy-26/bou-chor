@@ -45,8 +45,8 @@ import java.net.InetSocketAddress
 import java.net.NetworkInterface
 import java.net.ServerSocket
 import java.net.Socket
-import java.net.SocketTimeoutException
 import java.util.Collections
+import java.util.UUID
 import kotlin.math.sqrt
 
 /**
@@ -145,10 +145,15 @@ interface PeerEventsListener {
 
 /**
  * Local Network (Hotspot / Wi-Fi) Socket Manager.
- * Enables zero-internet and ultra-low latency direct LAN multiplayer when users are on
- * the same Wi-Fi router or Mobile Hotspot.
+ * Passes the established BufferedReader seamlessly from handshake to session reader
+ * so zero packets (like immediate lobby_sync) are ever lost in buffers.
  */
-class BouChorLanManager(private val listener: PeerEventsListener) {
+class BouChorLanManager(
+    private val localPeerId: String,
+    private val onStatus: (String, Boolean) -> Unit,
+    private val onPacketReceived: (senderId: String, payloadJson: String) -> Unit,
+    private val onPeerDisconnected: (peerId: String) -> Unit
+) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var serverSocket: ServerSocket? = null
     private var udpSocket: DatagramSocket? = null
@@ -158,8 +163,14 @@ class BouChorLanManager(private val listener: PeerEventsListener) {
     private var searchJob: Job? = null
     private var serverJob: Job? = null
     private var clientJob: Job? = null
+
+    @Volatile
     private var isHosting = false
+
+    @Volatile
     private var currentRoomCode = ""
+
+    @Volatile
     private var myName = "Player"
 
     fun startHosting(roomCode: String, playerName: String) {
@@ -174,10 +185,12 @@ class BouChorLanManager(private val listener: PeerEventsListener) {
                 serverSocket = ss
                 while (isActive) {
                     val client = ss.accept()
+                    client.tcpNoDelay = true
                     hostClientSockets.add(client)
                     launch { handleHostClient(client) }
                 }
-            } catch (_: Throwable) {}
+            } catch (_: Throwable) {
+            }
         }
 
         beaconJob = scope.launch {
@@ -196,13 +209,14 @@ class BouChorLanManager(private val listener: PeerEventsListener) {
                     val targets = getBroadcastAddresses()
                     for (target in targets) {
                         try {
-                            val packet = DatagramPacket(msg, msg.size, target, 8989)
-                            ds.send(packet)
-                        } catch (_: Throwable) {}
+                            ds.send(DatagramPacket(msg, msg.size, target, 8989))
+                        } catch (_: Throwable) {
+                        }
                     }
-                    delay(800)
+                    delay(900)
                 }
-            } catch (_: Throwable) {}
+            } catch (_: Throwable) {
+            }
         }
     }
 
@@ -210,17 +224,13 @@ class BouChorLanManager(private val listener: PeerEventsListener) {
         val list = mutableSetOf<InetAddress>()
         runCatching { list.add(InetAddress.getByName("255.255.255.255")) }
         runCatching { list.add(InetAddress.getByName("192.168.43.255")) }
-        runCatching { list.add(InetAddress.getByName("10.0.2.255")) }
         runCatching {
             val interfaces = NetworkInterface.getNetworkInterfaces()
             while (interfaces.hasMoreElements()) {
                 val netIf = interfaces.nextElement()
                 if (netIf.isLoopback || !netIf.isUp) continue
                 for (interfaceAddress in netIf.interfaceAddresses) {
-                    val bcast = interfaceAddress.broadcast
-                    if (bcast != null) {
-                        list.add(bcast)
-                    }
+                    interfaceAddress.broadcast?.let { list.add(it) }
                 }
             }
         }
@@ -229,34 +239,27 @@ class BouChorLanManager(private val listener: PeerEventsListener) {
 
     private suspend fun handleHostClient(socket: Socket) {
         val reader = BufferedReader(InputStreamReader(socket.getInputStream()))
-        val clientId = "lan_guest_${socket.port}"
+        var remoteSenderId = "lan_guest_${socket.port}"
         try {
             while (scope.isActive && socket.isConnected && !socket.isClosed) {
                 val line = reader.readLine() ?: break
-                val obj = JSONObject(line)
-                when (obj.optString("type")) {
-                    "hello" -> {
-                        val guestName = obj.optString("name", "Guest")
-                        listener.onRemotePeerJoined(clientId, guestName)
-                        val reply = JSONObject().apply {
-                            put("type", "hello_reply")
-                            put("name", myName)
-                            put("isHost", true)
-                            put("roomCode", currentRoomCode)
-                        }.toString()
-                        sendToSocket(socket, reply)
-                    }
-                    else -> {
-                        listener.onRemotePacket(clientId, line)
-                        broadcastExcept(line, socket)
-                    }
+                val obj = runCatching { JSONObject(line) }.getOrNull() ?: continue
+                val sid = obj.optString("senderId", "").ifBlank { remoteSenderId }
+                remoteSenderId = sid
+
+                onPacketReceived(sid, line)
+                if (obj.optString("type") != "hello") {
+                    broadcastExcept(line, socket)
                 }
             }
         } catch (_: Throwable) {
         } finally {
             hostClientSockets.remove(socket)
-            try { socket.close() } catch (_: Throwable) {}
-            listener.onRemotePeerLeft(clientId)
+            try {
+                socket.close()
+            } catch (_: Throwable) {
+            }
+            onPeerDisconnected(remoteSenderId)
         }
     }
 
@@ -272,25 +275,25 @@ class BouChorLanManager(private val listener: PeerEventsListener) {
             val discoveredIps = Collections.synchronizedSet(mutableSetOf<String>())
 
             if (targetInput.contains(".")) {
-                discoveredIps.add(targetInput)
+                discoveredIps.add(targetInput.substringBefore(":"))
             }
-
             discoveredIps.add("192.168.43.1")
             discoveredIps.add("10.0.2.2")
-            discoveredIps.add("10.0.2.15")
             discoveredIps.add("127.0.0.1")
 
             val beaconSocket = try {
                 DatagramSocket(8989).apply {
-                    soTimeout = 1200
+                    soTimeout = 1000
                     broadcast = true
                 }
-            } catch (_: Throwable) { null }
+            } catch (_: Throwable) {
+                null
+            }
 
             val startTime = System.currentTimeMillis()
 
-            // 1. UDP Listener coroutine
-            launch {
+            // UDP listener for local Wi-Fi / Hotspot beacons
+            val udpListenerJob = launch {
                 val buf = ByteArray(1024)
                 val packet = DatagramPacket(buf, buf.size)
                 while (isActive && !connected) {
@@ -301,88 +304,102 @@ class BouChorLanManager(private val listener: PeerEventsListener) {
                             val obj = JSONObject(text)
                             val code = obj.optString("code")
                             if (code.equals(currentRoomCode, ignoreCase = true) || targetInput.contains(".")) {
-                                val hostIp = packet.address?.hostAddress
-                                if (hostIp != null) {
-                                    discoveredIps.add(hostIp)
-                                }
+                                packet.address?.hostAddress?.let { discoveredIps.add(it) }
                             }
-                        } catch (_: Throwable) {}
+                        } catch (_: Throwable) {
+                        }
+                    } else {
+                        delay(400)
                     }
-                    delay(200)
                 }
             }
 
-            // 2. Parallel Fast Subnet IP Scanner
-            val localSubnets = getLocalSubnetPrefixes()
+            // Only scan the device's real active IPv4 subnets (no blind 1200-coroutine flood)
+            val activeSubnets = getActiveSubnetPrefixes()
 
-            while (isActive && !connected && (System.currentTimeMillis() - startTime < 12000)) {
+            while (isActive && !connected && (System.currentTimeMillis() - startTime < 15000)) {
                 val snapshot = discoveredIps.toList()
                 for (ip in snapshot) {
                     if (connected) break
-                    val s = tryConnectIp(ip)
-                    if (s != null) {
-                        clientSocket = s
+                    val connResult = tryConnectIp(ip)
+                    if (connResult != null) {
+                        val (sock, reader) = connResult
+                        clientSocket = sock
                         connected = true
-                        listener.onPeerStatus("Connected to Host via Local Network ($ip)", true)
-                        clientJob = launch { handleClientSession(s) }
+                        onStatus("Connected to Room $currentRoomCode (LAN)", true)
+                        clientJob = launch { handleClientSession(sock, reader) }
                         break
                     }
                 }
 
                 if (!connected) {
-                    for (prefix in localSubnets) {
+                    for (prefix in activeSubnets) {
                         if (connected) break
                         val jobs = (1..254).map { lastOctet ->
                             async {
                                 if (connected) return@async null
-                                val testIp = "$prefix$lastOctet"
-                                tryConnectIp(testIp)
+                                tryConnectIp("$prefix$lastOctet")
                             }
                         }
                         for (j in jobs) {
-                            val resSocket = j.await()
-                            if (resSocket != null && !connected) {
-                                clientSocket = resSocket
+                            val res = j.await()
+                            if (res != null && !connected) {
+                                val (sock, reader) = res
+                                clientSocket = sock
                                 connected = true
-                                listener.onPeerStatus("Connected to Host via Local Network ($prefix...)", true)
-                                clientJob = launch { handleClientSession(resSocket) }
+                                onStatus("Connected to Room $currentRoomCode (LAN)", true)
+                                clientJob = launch { handleClientSession(sock, reader) }
                                 break
                             }
                         }
                     }
                 }
 
-                delay(600)
+                delay(700)
             }
-            try { beaconSocket?.close() } catch (_: Throwable) {}
+
+            udpListenerJob.cancel()
+            try {
+                beaconSocket?.close()
+            } catch (_: Throwable) {
+            }
         }
     }
 
-    private suspend fun tryConnectIp(ip: String): Socket? = withContext(Dispatchers.IO) {
+    private suspend fun tryConnectIp(ip: String): Pair<Socket, BufferedReader>? = withContext(Dispatchers.IO) {
         try {
             val s = Socket()
-            s.connect(InetSocketAddress(ip, 8988), 350)
+            s.tcpNoDelay = true
+            s.connect(InetSocketAddress(ip, 8988), 320)
             val out = PrintWriter(OutputStreamWriter(s.getOutputStream()), true)
             val hello = JSONObject().apply {
                 put("type", "hello")
+                put("senderId", localPeerId)
                 put("name", myName)
                 put("isHost", false)
                 put("roomCode", currentRoomCode)
+                put("pktId", "${localPeerId}_lan_hello")
             }.toString()
             out.println(hello)
 
-            s.soTimeout = 800
+            s.soTimeout = 900
             val reader = BufferedReader(InputStreamReader(s.getInputStream()))
-            val respLine = reader.readLine() ?: return@withContext null
+            val respLine = reader.readLine()
+            if (respLine == null) {
+                try { s.close() } catch (_: Throwable) {}
+                return@withContext null
+            }
             val obj = JSONObject(respLine)
             val respType = obj.optString("type")
             val respCode = obj.optString("roomCode")
 
-            if (respType == "hello_reply" && (currentRoomCode.contains(".") || respCode.equals(currentRoomCode, ignoreCase = true))) {
-                val hostName = obj.optString("name", "Host")
-                listener.onRemotePeerJoined("lan_host", hostName)
+            if ((respType == "hello_reply" || respType == "lobby_sync") &&
+                (currentRoomCode.contains(".") || respCode.equals(currentRoomCode, ignoreCase = true))
+            ) {
                 s.soTimeout = 0
-                s
+                val sid = obj.optString("senderId", "lan_host")
+                onPacketReceived(sid, respLine)
+                Pair(s, reader)
             } else {
                 try { s.close() } catch (_: Throwable) {}
                 null
@@ -392,13 +409,8 @@ class BouChorLanManager(private val listener: PeerEventsListener) {
         }
     }
 
-    private fun getLocalSubnetPrefixes(): List<String> {
+    private fun getActiveSubnetPrefixes(): List<String> {
         val prefixes = mutableSetOf<String>()
-        prefixes.add("192.168.1.")
-        prefixes.add("192.168.0.")
-        prefixes.add("192.168.43.")
-        prefixes.add("10.0.2.")
-        prefixes.add("172.20.10.")
         try {
             val interfaces = NetworkInterface.getNetworkInterfaces()
             while (interfaces.hasMoreElements()) {
@@ -411,37 +423,33 @@ class BouChorLanManager(private val listener: PeerEventsListener) {
                         val host = addr.hostAddress ?: continue
                         val lastDot = host.lastIndexOf('.')
                         if (lastDot > 0) {
-                            val prefix = host.substring(0, lastDot + 1)
-                            prefixes.add(prefix)
+                            prefixes.add(host.substring(0, lastDot + 1))
                         }
                     }
                 }
             }
-        } catch (_: Throwable) {}
+        } catch (_: Throwable) {
+        }
         return prefixes.toList()
     }
 
-    private suspend fun handleClientSession(socket: Socket) {
-        val reader = BufferedReader(InputStreamReader(socket.getInputStream()))
-        val hostId = "lan_host"
+    private suspend fun handleClientSession(socket: Socket, reader: BufferedReader) {
+        var hostSenderId = "lan_host"
         try {
             while (scope.isActive && socket.isConnected && !socket.isClosed) {
                 val line = reader.readLine() ?: break
-                val obj = JSONObject(line)
-                when (obj.optString("type")) {
-                    "hello_reply" -> {
-                        val hName = obj.optString("name", "Host")
-                        listener.onRemotePeerJoined(hostId, hName)
-                    }
-                    else -> {
-                        listener.onRemotePacket(hostId, line)
-                    }
-                }
+                val obj = runCatching { JSONObject(line) }.getOrNull() ?: continue
+                val sid = obj.optString("senderId", "").ifBlank { hostSenderId }
+                hostSenderId = sid
+                onPacketReceived(sid, line)
             }
         } catch (_: Throwable) {
         } finally {
-            try { socket.close() } catch (_: Throwable) {}
-            listener.onRemotePeerLeft(hostId)
+            try {
+                socket.close()
+            } catch (_: Throwable) {
+            }
+            onPeerDisconnected(hostSenderId)
         }
     }
 
@@ -475,7 +483,9 @@ class BouChorLanManager(private val listener: PeerEventsListener) {
                 val out = PrintWriter(OutputStreamWriter(s.getOutputStream()), true)
                 out.println(data)
                 true
-            } else false
+            } else {
+                false
+            }
         } catch (_: Throwable) {
             false
         }
@@ -523,22 +533,58 @@ fun getPrimaryLocalIpAddress(): String {
                 }
             }
         }
-    } catch (_: Throwable) {}
+    } catch (_: Throwable) {
+    }
     return "127.0.0.1"
 }
 
 /**
- * Headless PeerJS + WebRTC P2P data and proximity voice chat bridge,
- * augmented with local LAN / Hotspot direct socket connectivity.
+ * Unified P2P + Cloud Relay + LAN Networking Controller.
+ * Combines:
+ * 1) Pure-Kotlin MQTT Cloud Relay (works across emulators, mobile CGNAT, and global internet)
+ * 2) Local Network LAN/Hotspot Sockets (works offline with zero latency)
+ * 3) WebRTC / PeerJS Bridge (handles proximity voice audio + backup data channel)
  */
 class PeerBridgeController(
     private val context: Context,
     private val listener: PeerEventsListener
 ) {
+    val localPeerId: String = "p_" + UUID.randomUUID().toString().replace("-", "").take(10)
+
     private var webView: WebView? = null
     private var isPageReady = false
     private val pendingScripts = mutableListOf<String>()
-    private val lanManager = BouChorLanManager(listener)
+    private val seenPacketIds = Collections.synchronizedSet(LinkedHashSet<String>())
+    private var localPacketSeq = 1L
+
+    @Volatile
+    private var isHostingMode = false
+
+    @Volatile
+    private var activeRoomCode = ""
+
+    @Volatile
+    private var activePlayerName = "Player"
+
+    @Volatile
+    private var hasPrimaryConnection = false
+
+    private val lanManager = BouChorLanManager(
+        localPeerId = localPeerId,
+        onStatus = { msg, ok -> updateTransportStatus("LAN", msg, ok) },
+        onPacketReceived = { sid, payload -> handleUnifiedPacket(sid, payload) },
+        onPeerDisconnected = { sid ->
+            if (!hasPrimaryConnection) {
+                listener.onRemotePeerLeft(sid)
+            }
+        }
+    )
+
+    private val relayManager = BouChorMqttRelayManager(
+        localPeerId = localPeerId,
+        onStatus = { msg, ok -> updateTransportStatus("RELAY", msg, ok) },
+        onPacketReceived = { sid, payload -> handleUnifiedPacket(sid, payload) }
+    )
 
     private val peerJsSource: String by lazy {
         try {
@@ -548,35 +594,65 @@ class PeerBridgeController(
         }
     }
 
-    fun getBridgeHtml(): String = buildBridgeHtml(peerJsSource)
+    fun getBridgeHtml(): String = buildBridgeHtml(peerJsSource, localPeerId)
 
     fun attachWebView(view: WebView) {
         webView = view
     }
 
     fun onPageReady() {
+        if (isPageReady) return
         isPageReady = true
         pendingScripts.forEach { evalJs(it) }
         pendingScripts.clear()
     }
 
     fun createRoom(roomCode: String, playerName: String) {
-        lanManager.startHosting(roomCode, playerName)
+        seenPacketIds.clear()
+        isHostingMode = true
+        activeRoomCode = roomCode.trim().uppercase()
+        activePlayerName = playerName
+        hasPrimaryConnection = false
+
+        lanManager.startHosting(activeRoomCode, playerName)
+        relayManager.startHosting(activeRoomCode, playerName)
+
         val safeName = JSONObject.quote(playerName)
-        val safeCode = JSONObject.quote(roomCode)
+        val safeCode = JSONObject.quote(activeRoomCode)
         evalJs("window.BouChorNet && window.BouChorNet.createRoom($safeCode, $safeName);")
     }
 
     fun joinRoom(roomCode: String, playerName: String) {
-        lanManager.startJoining(roomCode, playerName)
+        seenPacketIds.clear()
+        isHostingMode = false
+        activeRoomCode = roomCode.trim().uppercase()
+        activePlayerName = playerName
+        hasPrimaryConnection = false
+
+        lanManager.startJoining(activeRoomCode, playerName)
+        relayManager.startJoining(activeRoomCode, playerName)
+
         val safeName = JSONObject.quote(playerName)
-        val safeCode = JSONObject.quote(roomCode)
+        val safeCode = JSONObject.quote(activeRoomCode)
         evalJs("window.BouChorNet && window.BouChorNet.joinRoom($safeCode, $safeName);")
     }
 
     fun broadcastJson(json: String) {
-        lanManager.broadcast(json)
-        val quoted = JSONObject.quote(json)
+        val enriched = try {
+            val obj = JSONObject(json)
+            if (!obj.has("senderId")) obj.put("senderId", localPeerId)
+            if (!obj.has("roomCode") && activeRoomCode.isNotEmpty()) obj.put("roomCode", activeRoomCode)
+            if (obj.optString("type") != "pos" && !obj.has("pktId")) {
+                obj.put("pktId", "${localPeerId}_${localPacketSeq++}")
+            }
+            obj.toString()
+        } catch (_: Throwable) {
+            json
+        }
+
+        lanManager.broadcast(enriched)
+        relayManager.publish(enriched)
+        val quoted = JSONObject.quote(enriched)
         evalJs("window.BouChorNet && window.BouChorNet.broadcast($quoted);")
     }
 
@@ -590,8 +666,97 @@ class PeerBridgeController(
     }
 
     fun disconnect() {
+        if (activeRoomCode.isNotEmpty()) {
+            val bye = JSONObject().apply {
+                put("type", "bye")
+                put("senderId", localPeerId)
+                put("name", activePlayerName)
+                put("roomCode", activeRoomCode)
+            }.toString()
+            lanManager.broadcast(bye)
+            relayManager.publish(bye)
+        }
+        hasPrimaryConnection = false
+        activeRoomCode = ""
         lanManager.stopAll()
+        relayManager.stopAll()
         evalJs("window.BouChorNet && window.BouChorNet.disconnect();")
+    }
+
+    private fun updateTransportStatus(source: String, status: String, isConnected: Boolean) {
+        if (isConnected) {
+            hasPrimaryConnection = true
+            listener.onPeerStatus(status, true)
+        } else if (!hasPrimaryConnection || source != "WEBRTC") {
+            listener.onPeerStatus(status, hasPrimaryConnection)
+        }
+    }
+
+    private fun handleUnifiedPacket(fallbackPeerId: String, rawPayload: String) {
+        val obj = runCatching { JSONObject(rawPayload) }.getOrNull() ?: return
+        val type = obj.optString("type", "")
+        val senderId = obj.optString("senderId", "").ifBlank { fallbackPeerId }
+        if (senderId == localPeerId) return
+
+        val pktId = obj.optString("pktId", "")
+        if (pktId.isNotEmpty() && type != "pos") {
+            synchronized(seenPacketIds) {
+                if (seenPacketIds.contains(pktId)) return
+                seenPacketIds.add(pktId)
+                if (seenPacketIds.size > 256) {
+                    val iter = seenPacketIds.iterator()
+                    if (iter.hasNext()) {
+                        iter.next()
+                        iter.remove()
+                    }
+                }
+            }
+        }
+
+        when (type) {
+            "hello" -> {
+                val guestName = obj.optString("name", "Guest")
+                if (isHostingMode) {
+                    val reply = JSONObject().apply {
+                        put("type", "hello_reply")
+                        put("senderId", localPeerId)
+                        put("name", activePlayerName)
+                        put("isHost", true)
+                        put("roomCode", activeRoomCode)
+                        put("pktId", "${localPeerId}_reply_${System.currentTimeMillis()}")
+                    }.toString()
+                    lanManager.broadcast(reply)
+                    relayManager.publish(reply)
+                    val quotedReply = JSONObject.quote(reply)
+                    evalJs("window.BouChorNet && window.BouChorNet.broadcast($quotedReply);")
+                }
+                listener.onRemotePeerJoined(senderId, guestName)
+            }
+
+            "hello_reply" -> {
+                val hostName = obj.optString("name", "Host")
+                relayManager.markGuestHandshakeDone()
+                hasPrimaryConnection = true
+                listener.onPeerStatus("Connected to Room $activeRoomCode!", true)
+                listener.onRemotePeerJoined(senderId, hostName)
+            }
+
+            "lobby_sync" -> {
+                if (!isHostingMode) {
+                    relayManager.markGuestHandshakeDone()
+                    hasPrimaryConnection = true
+                }
+                listener.onRemotePacket(senderId, rawPayload)
+            }
+
+            "bye" -> {
+                listener.onRemotePeerLeft(senderId)
+            }
+
+            else -> {
+                listener.onRemotePacket(senderId, rawPayload)
+            }
+        }
     }
 
     private fun evalJs(script: String) {
@@ -605,23 +770,35 @@ class PeerBridgeController(
 
     inner class JsBridge {
         @JavascriptInterface
+        fun onBridgeReady() {
+            onPageReady()
+        }
+
+        @JavascriptInterface
         fun onStatus(status: String, connected: Boolean) {
-            listener.onPeerStatus(status, connected)
+            updateTransportStatus("WEBRTC", status, connected)
         }
 
         @JavascriptInterface
         fun onPeerJoined(peerId: String, name: String) {
-            listener.onRemotePeerJoined(peerId, name)
+            val wrapped = JSONObject().apply {
+                put("type", "hello")
+                put("senderId", peerId)
+                put("name", name)
+            }.toString()
+            handleUnifiedPacket(peerId, wrapped)
         }
 
         @JavascriptInterface
         fun onPeerLeft(peerId: String) {
-            listener.onRemotePeerLeft(peerId)
+            if (!hasPrimaryConnection) {
+                listener.onRemotePeerLeft(peerId)
+            }
         }
 
         @JavascriptInterface
         fun onPacket(peerId: String, payload: String) {
-            listener.onRemotePacket(peerId, payload)
+            handleUnifiedPacket(peerId, payload)
         }
 
         @JavascriptInterface
@@ -650,11 +827,19 @@ fun HeadlessPeerBridge(
                     override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
                         return true
                     }
+
+                    override fun onPageFinished(view: WebView?, url: String?) {
+                        controller.onPageReady()
+                    }
                 }
                 webChromeClient = object : WebChromeClient() {
                     override fun onPermissionRequest(request: PermissionRequest) {
                         val wantsAudio = request.resources.contains(PermissionRequest.RESOURCE_AUDIO_CAPTURE)
-                        if (wantsAudio && micPermissionGranted) {
+                        val hasRuntimeMic = ContextCompat.checkSelfPermission(
+                            ctx,
+                            Manifest.permission.RECORD_AUDIO
+                        ) == PackageManager.PERMISSION_GRANTED
+                        if (wantsAudio && (micPermissionGranted || hasRuntimeMic)) {
                             request.grant(arrayOf(PermissionRequest.RESOURCE_AUDIO_CAPTURE))
                         } else {
                             request.deny()
@@ -669,13 +854,13 @@ fun HeadlessPeerBridge(
                     "UTF-8",
                     null
                 )
-                postDelayed({ controller.onPageReady() }, 200)
+                postDelayed({ controller.onPageReady() }, 500)
             }
         }
     )
 }
 
-private fun buildBridgeHtml(peerJsContent: String): String = """
+private fun buildBridgeHtml(peerJsContent: String, localPeerId: String): String = """
 <!DOCTYPE html>
 <html>
 <head>
@@ -687,6 +872,7 @@ $peerJsContent
 <body>
 <script>
 (function() {
+  const LOCAL_PEER_ID = "$localPeerId";
   let peer = null;
   let dataConns = {};
   let mediaCalls = {};
@@ -699,28 +885,16 @@ $peerJsContent
   let myRoomCode = "";
 
   const PEER_CONFIG = {
-    debug: 1,
+    debug: 0,
     config: {
       iceServers: [
         { urls: 'stun:stun.l.google.com:19302' },
         { urls: 'stun:stun1.l.google.com:19302' },
         { urls: 'stun:stun2.l.google.com:19302' },
-        { urls: 'stun:stun3.l.google.com:19302' },
-        { urls: 'stun:stun4.l.google.com:19302' },
-        { urls: 'stun:stun.services.mozilla.com' },
         { urls: 'stun:stun.cloudflare.com:3478' },
-        { urls: 'stun:global.stun.twilio.com:3478' },
-        {
-          urls: [
-            'turn:openrelay.metered.ca:80',
-            'turn:openrelay.metered.ca:443',
-            'turn:openrelay.metered.ca:443?transport=tcp'
-          ],
-          username: 'openrelay',
-          credential: 'openrelay'
-        }
+        { urls: 'stun:stun.services.mozilla.com' }
       ],
-      iceCandidatePoolSize: 10
+      iceCandidatePoolSize: 4
     }
   };
 
@@ -732,8 +906,13 @@ $peerJsContent
     if (localStream) return localStream;
     try {
       if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
-        localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
-        localStream.getAudioTracks().forEach(t => t.enabled = micEnabled);
+        const mediaPromise = navigator.mediaDevices.getUserMedia({ audio: true, video: false }).then(s => {
+          localStream = s;
+          localStream.getAudioTracks().forEach(t => t.enabled = micEnabled);
+          return s;
+        }).catch(() => null);
+        const timeoutPromise = new Promise(resolve => setTimeout(() => resolve(null), 1500));
+        await Promise.race([mediaPromise, timeoutPromise]);
       }
     } catch (e) {
       localStream = null;
@@ -771,13 +950,15 @@ $peerJsContent
     dataConns[conn.peer] = conn;
 
     function handleOpen() {
-      notifyStatus(isOutgoing ? ('Connected to Room ' + myRoomCode + '!') : 'Player joined!', true);
+      notifyStatus(isOutgoing ? ('Connected to Room ' + myRoomCode + ' (P2P)') : 'Player joined!', true);
       try {
         conn.send(JSON.stringify({
           type: 'hello',
+          senderId: LOCAL_PEER_ID,
           name: myName,
           isHost: !isOutgoing,
-          roomCode: myRoomCode
+          roomCode: myRoomCode,
+          pktId: LOCAL_PEER_ID + '_rtc_hello_' + Date.now()
         }));
       } catch (e) {}
 
@@ -800,31 +981,9 @@ $peerJsContent
 
     conn.on('data', (raw) => {
       try {
-        const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
-        if (parsed.type === 'hello') {
-          const senderName = parsed.name || (parsed.isHost ? 'Host' : 'Guest');
-          if (window.AndroidBridge) {
-            window.AndroidBridge.onPeerJoined(conn.peer, senderName);
-          }
-          if (!isOutgoing) {
-            try {
-              conn.send(JSON.stringify({
-                type: 'hello_reply',
-                name: myName,
-                isHost: true,
-                roomCode: myRoomCode
-              }));
-            } catch (e) {}
-          }
-        } else if (parsed.type === 'hello_reply') {
-          const hostName = parsed.name || 'Host';
-          if (window.AndroidBridge) {
-            window.AndroidBridge.onPeerJoined(conn.peer, hostName);
-          }
-        } else {
-          if (window.AndroidBridge) {
-            window.AndroidBridge.onPacket(conn.peer, typeof raw === 'string' ? raw : JSON.stringify(raw));
-          }
+        const str = typeof raw === 'string' ? raw : JSON.stringify(raw);
+        if (window.AndroidBridge) {
+          window.AndroidBridge.onPacket(conn.peer, str);
         }
       } catch (e) {}
     });
@@ -835,9 +994,7 @@ $peerJsContent
       if (window.AndroidBridge) window.AndroidBridge.onPeerLeft(conn.peer);
     });
 
-    conn.on('error', (err) => {
-      console.error('Conn error', err);
-    });
+    conn.on('error', () => {});
   }
 
   window.BouChorNet = {
@@ -845,17 +1002,13 @@ $peerJsContent
       this.disconnect();
       myName = name || 'Host';
       myRoomCode = (code || '').toUpperCase();
-      if (typeof Peer === 'undefined') {
-        notifyStatus('P2P Initializing...', false);
-        return;
-      }
+      if (!myRoomCode || myRoomCode.indexOf('.') >= 0 || typeof Peer === 'undefined') return;
       await ensureAudioStream();
-      notifyStatus('Opening P2P Room ' + myRoomCode + '...', false);
       try {
         const hostPeerId = 'bouchor-room-' + myRoomCode;
         peer = new Peer(hostPeerId, PEER_CONFIG);
-        peer.on('open', (id) => {
-          notifyStatus('Room ' + myRoomCode + ' Live (P2P WebRTC)', true);
+        peer.on('open', () => {
+          notifyStatus('Room ' + myRoomCode + ' Live (Relay + WebRTC)', true);
         });
         peer.on('connection', (conn) => {
           wireDataConn(conn, false);
@@ -865,47 +1018,30 @@ $peerJsContent
           mediaCalls[call.peer] = call;
           call.on('stream', (rs) => attachRemoteStream(call.peer, rs));
         });
-        peer.on('error', (err) => {
-          const errType = err ? err.type : '';
-          if (errType === 'unavailable-id') {
-            notifyStatus('Room code in use! Try creating again.', false);
-          } else {
-            notifyStatus('P2P status: ' + (errType || 'waiting'), false);
-          }
-        });
-      } catch (e) {
-        notifyStatus('Local Lobby Ready', false);
-      }
+        peer.on('error', () => {});
+      } catch (e) {}
     },
 
     joinRoom: async function(code, name) {
       this.disconnect();
       myName = name || 'Guest';
       myRoomCode = (code || '').toUpperCase();
-      if (typeof Peer === 'undefined') {
-        notifyStatus('P2P Initializing...', false);
-        return;
-      }
+      if (!myRoomCode || myRoomCode.indexOf('.') >= 0 || typeof Peer === 'undefined') return;
       await ensureAudioStream();
-      notifyStatus('Connecting to Room ' + myRoomCode + '...', false);
       try {
-        peer = new Peer(null, PEER_CONFIG);
-        peer.on('open', (myId) => {
+        peer = new Peer(PEER_CONFIG);
+        peer.on('open', () => {
           const hostId = 'bouchor-room-' + myRoomCode;
-          const conn = peer.connect(hostId, { reliable: true });
+          const conn = peer.connect(hostId, { reliable: true, serialization: 'json' });
           wireDataConn(conn, true);
         });
-        peer.on('error', (err) => {
-          const errType = err ? err.type : '';
-          if (errType === 'peer-unavailable') {
-            notifyStatus('Room ' + myRoomCode + ' not found! Host may still be starting.', false);
-          } else {
-            notifyStatus('Connecting... (' + (errType || 'P2P') + ')', false);
-          }
+        peer.on('call', (call) => {
+          call.answer(localStream || undefined);
+          mediaCalls[call.peer] = call;
+          call.on('stream', (rs) => attachRemoteStream(call.peer, rs));
         });
-      } catch (e) {
-        notifyStatus('Join failed', false);
-      }
+        peer.on('error', () => {});
+      } catch (e) {}
     },
 
     broadcast: function(jsonStr) {
@@ -939,6 +1075,10 @@ $peerJsContent
       if (peer) { try { peer.destroy(); } catch(e) {} peer = null; }
     }
   };
+
+  if (window.AndroidBridge && window.AndroidBridge.onBridgeReady) {
+    window.AndroidBridge.onBridgeReady();
+  }
 })();
 </script>
 </body>

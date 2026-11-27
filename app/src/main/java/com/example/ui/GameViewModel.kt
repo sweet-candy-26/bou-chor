@@ -189,7 +189,13 @@ class GameViewModel(application: Application) : AndroidViewModel(application), P
         val code = generateRoomCode()
         val name = _uiState.value.playerName.ifBlank { "Host" }
         val localIp = getPrimaryLocalIpAddress()
-        val localPlayer = LobbyPlayer("local_player", name, isHost = true, isLocal = true, micEnabled = _uiState.value.isMicEnabled)
+        val localPlayer = LobbyPlayer(
+            id = peerController.localPeerId,
+            name = name,
+            isHost = true,
+            isLocal = true,
+            micEnabled = _uiState.value.isMicEnabled
+        )
         _uiState.update {
             it.copy(
                 screen = ScreenMode.Lobby,
@@ -197,9 +203,11 @@ class GameViewModel(application: Application) : AndroidViewModel(application), P
                 hostIpAddress = localIp,
                 isHost = true,
                 isSoloMode = false,
+                isPeerConnected = false,
+                peerStatusText = "Opening Room $code...",
                 lobbyPlayers = listOf(localPlayer),
                 chatMessages = listOf(
-                    ChatMessage(nextChatId++, "sys", "Biye Bari", null, "Room $code created! (Host IP: $localIp)", ChatChannel.ALL)
+                    ChatMessage(nextChatId++, "sys", "Biye Bari", null, "Room $code created! Share code $code (or IP: $localIp).", ChatChannel.ALL)
                 )
             )
         }
@@ -214,16 +222,24 @@ class GameViewModel(application: Application) : AndroidViewModel(application), P
             return
         }
         val name = _uiState.value.playerName.ifBlank { "Guest" }
-        val localPlayer = LobbyPlayer("local_player", name, isHost = false, isLocal = true, micEnabled = _uiState.value.isMicEnabled)
+        val localPlayer = LobbyPlayer(
+            id = peerController.localPeerId,
+            name = name,
+            isHost = false,
+            isLocal = true,
+            micEnabled = _uiState.value.isMicEnabled
+        )
         _uiState.update {
             it.copy(
                 screen = ScreenMode.Lobby,
                 roomCode = input,
                 isHost = false,
                 isSoloMode = false,
+                isPeerConnected = false,
+                peerStatusText = "Connecting to Room $input...",
                 lobbyPlayers = listOf(localPlayer),
                 chatMessages = listOf(
-                    ChatMessage(nextChatId++, "sys", "Biye Bari", null, "Connecting to Room $input via Local Network / WebRTC...", ChatChannel.ALL)
+                    ChatMessage(nextChatId++, "sys", "Biye Bari", null, "Connecting to Room $input via Cloud Relay / LAN...", ChatChannel.ALL)
                 )
             )
         }
@@ -233,7 +249,13 @@ class GameViewModel(application: Application) : AndroidViewModel(application), P
 
     fun startSoloMatch(preferredRole: Role? = null) {
         val name = _uiState.value.playerName.ifBlank { "Player" }
-        val localLobby = LobbyPlayer("local_player", name, isHost = true, isLocal = true, micEnabled = _uiState.value.isMicEnabled)
+        val localLobby = LobbyPlayer(
+            id = peerController.localPeerId,
+            name = name,
+            isHost = true,
+            isLocal = true,
+            micEnabled = _uiState.value.isMicEnabled
+        )
         _uiState.update {
             it.copy(
                 isSoloMode = true,
@@ -260,7 +282,6 @@ class GameViewModel(application: Application) : AndroidViewModel(application), P
             st.lobbyPlayers.forEachIndexed { i, p ->
                 val assignedRole = allRoles.getOrElse(i) { Role.entries[i % Role.entries.size] }
                 roleMap[p.id] = assignedRole
-                roleMap[p.name] = assignedRole
                 val assignObj = JSONObject().apply {
                     put("id", p.id)
                     put("name", p.name)
@@ -303,6 +324,8 @@ class GameViewModel(application: Application) : AndroidViewModel(application), P
             it.copy(
                 screen = ScreenMode.Title,
                 roomCode = "",
+                isPeerConnected = false,
+                peerStatusText = "Online Relay + LAN Ready",
                 lobbyPlayers = emptyList(),
                 chatMessages = emptyList(),
                 isTeamRadioEnabled = false
@@ -441,9 +464,15 @@ class GameViewModel(application: Application) : AndroidViewModel(application), P
         val local = world.localPlayer ?: return
         val json = JSONObject().apply {
             put("type", "pos")
+            put("senderId", peerController.localPeerId)
             put("x", local.pos.x.toDouble())
             put("z", local.pos.z.toDouble())
             put("yaw", local.yaw.toDouble())
+            put("moving", local.isMoving)
+            put("carrying", local.isCarryingBou)
+            put("sack", local.isCarriedInSack)
+            put("boost", local.speedBoostTimer > 0f)
+            put("stun", local.stunTimer > 0f)
         }.toString()
         peerController.broadcastJson(json)
 
@@ -546,7 +575,7 @@ class GameViewModel(application: Application) : AndroidViewModel(application), P
         val st = _uiState.value
         val channel = overrideChannel ?: st.activeChatChannel
         val local = latestWorld.localPlayer
-        val senderId = local?.id ?: "local_player"
+        val senderId = local?.id ?: peerController.localPeerId
         val senderName = local?.name ?: st.playerName
         val senderRole = local?.role
 
@@ -563,6 +592,7 @@ class GameViewModel(application: Application) : AndroidViewModel(application), P
         if (!st.isSoloMode) {
             val chatJson = JSONObject().apply {
                 put("type", "chat")
+                put("senderId", peerController.localPeerId)
                 put("name", senderName)
                 put("text", text)
                 put("channel", channel.name)
@@ -592,21 +622,27 @@ class GameViewModel(application: Application) : AndroidViewModel(application), P
         }
     }
 
-    // PeerJS WebRTC & LAN Callbacks
+    // PeerJS WebRTC, Cloud Relay & LAN Callbacks
     override fun onPeerStatus(status: String, isConnected: Boolean) {
         _uiState.update { it.copy(peerStatusText = status, isPeerConnected = isConnected) }
     }
 
     override fun onRemotePeerJoined(peerId: String, name: String) {
+        if (peerId == peerController.localPeerId) return
         val st = _uiState.value
         val weAreHost = st.isHost
 
+        var addedNew = false
         _uiState.update { current ->
-            if (current.lobbyPlayers.any { it.id == peerId || (it.name == name && !it.isLocal) }) {
-                return@update current
+            if (current.lobbyPlayers.any { it.id == peerId }) {
+                return@update current.copy(
+                    isPeerConnected = true,
+                    peerStatusText = "Room ${current.roomCode} Live (${current.lobbyPlayers.size}/5)"
+                )
             }
             if (current.lobbyPlayers.size >= 5) return@update current
 
+            addedNew = true
             val newPlayer = LobbyPlayer(
                 id = peerId,
                 name = name,
@@ -617,10 +653,13 @@ class GameViewModel(application: Application) : AndroidViewModel(application), P
             current.copy(
                 lobbyPlayers = updated,
                 isPeerConnected = true,
-                peerStatusText = "Room ${current.roomCode} Live"
+                peerStatusText = "Room ${current.roomCode} Live (${updated.size}/5)"
             )
         }
-        appendChat("sys", "Biye Bari", null, "$name joined the wedding!", ChatChannel.ALL, playSound = true)
+
+        if (addedNew) {
+            appendChat("sys", "Biye Bari", null, "$name joined the wedding!", ChatChannel.ALL, playSound = true)
+        }
 
         if (weAreHost) {
             broadcastLobbySync()
@@ -629,12 +668,13 @@ class GameViewModel(application: Application) : AndroidViewModel(application), P
 
     override fun onRemotePeerLeft(peerId: String) {
         val st = _uiState.value
-        val leavingPlayer = st.lobbyPlayers.firstOrNull { it.id == peerId }
-        val wasHost = leavingPlayer?.isHost == true
+        val leavingPlayer = st.lobbyPlayers.firstOrNull { it.id == peerId } ?: return
+        val wasHost = leavingPlayer.isHost
 
         _uiState.update { current ->
             current.copy(lobbyPlayers = current.lobbyPlayers.filterNot { it.id == peerId })
         }
+        appendChat("sys", "Biye Bari", null, "${leavingPlayer.name} left the room.", ChatChannel.ALL, playSound = false)
 
         if (wasHost && !st.isHost) {
             showToast("Host left the room!")
@@ -659,6 +699,7 @@ class GameViewModel(application: Application) : AndroidViewModel(application), P
         }
         val syncJson = JSONObject().apply {
             put("type", "lobby_sync")
+            put("senderId", peerController.localPeerId)
             put("roomCode", st.roomCode)
             put("players", playersArray)
         }.toString()
@@ -668,9 +709,13 @@ class GameViewModel(application: Application) : AndroidViewModel(application), P
     override fun onRemotePacket(peerId: String, payloadJson: String) {
         try {
             val obj = JSONObject(payloadJson)
+            val senderId = obj.optString("senderId", "").ifBlank { peerId }
+            if (senderId == peerController.localPeerId) return
+
             when (obj.optString("type")) {
                 "lobby_sync" -> {
                     val playersArray = obj.optJSONArray("players") ?: return
+                    val myId = peerController.localPeerId
                     val myName = _uiState.value.playerName
                     val syncedList = mutableListOf<LobbyPlayer>()
 
@@ -679,10 +724,10 @@ class GameViewModel(application: Application) : AndroidViewModel(application), P
                         val id = pObj.getString("id")
                         val name = pObj.getString("name")
                         val isHost = pObj.optBoolean("isHost", false)
-                        val isLocal = (!isHost && (id == "local_player" || name == myName))
+                        val isLocal = (id == myId)
                         syncedList.add(
                             LobbyPlayer(
-                                id = if (isLocal) "local_player" else id,
+                                id = id,
                                 name = name,
                                 isHost = isHost,
                                 isLocal = isLocal,
@@ -694,7 +739,7 @@ class GameViewModel(application: Application) : AndroidViewModel(application), P
 
                     val hasLocal = syncedList.any { it.isLocal }
                     val finalList = if (!hasLocal) {
-                        listOf(LobbyPlayer("local_player", myName, isHost = false, isLocal = true)) + syncedList
+                        syncedList + LobbyPlayer(myId, myName, isHost = false, isLocal = true, micEnabled = _uiState.value.isMicEnabled)
                     } else {
                         syncedList
                     }
@@ -702,7 +747,7 @@ class GameViewModel(application: Application) : AndroidViewModel(application), P
                         it.copy(
                             lobbyPlayers = finalList,
                             isPeerConnected = true,
-                            peerStatusText = "Room ${it.roomCode} Live"
+                            peerStatusText = "Room ${it.roomCode} Live (${finalList.size}/5)"
                         )
                     }
                 }
@@ -710,6 +755,7 @@ class GameViewModel(application: Application) : AndroidViewModel(application), P
                 "start_match" -> {
                     val assignmentsArray = obj.optJSONArray("assignments")
                     if (assignmentsArray != null) {
+                        val myId = peerController.localPeerId
                         val myName = _uiState.value.playerName
                         var myAssignedRole: Role? = null
                         val roleMap = mutableMapOf<String, Role>()
@@ -721,8 +767,7 @@ class GameViewModel(application: Application) : AndroidViewModel(application), P
                             val r = runCatching { Role.valueOf(rName) }.getOrNull()
                             if (r != null) {
                                 roleMap[pid] = r
-                                roleMap[pname] = r
-                                if (pid == "local_player" || pname == myName) {
+                                if (pid == myId || (myAssignedRole == null && pname == myName && !pid.startsWith("p_"))) {
                                     myAssignedRole = r
                                 }
                             }
@@ -742,10 +787,10 @@ class GameViewModel(application: Application) : AndroidViewModel(application), P
                     val text = obj.optString("text")
                     val name = obj.optString("name", "Guest")
                     val ch = runCatching { ChatChannel.valueOf(obj.optString("channel", "ALL")) }.getOrDefault(ChatChannel.ALL)
-                    appendChat(peerId, name, null, text, ch, playSound = true)
+                    appendChat(senderId, name, null, text, ch, playSound = true)
                     latestWorld = latestWorld.copy(
                         players = latestWorld.players.map { p ->
-                            if (p.id == peerId || p.name == name) p.copy(speechBubbleText = text, speechBubbleTimer = 4.0f) else p
+                            if (p.id == senderId || p.name == name) p.copy(speechBubbleText = text, speechBubbleTimer = 4.0f) else p
                         }
                     )
                 }
@@ -754,9 +799,25 @@ class GameViewModel(application: Application) : AndroidViewModel(application), P
                     val x = obj.optDouble("x", 0.0).toFloat()
                     val z = obj.optDouble("z", 0.0).toFloat()
                     val yaw = obj.optDouble("yaw", 0.0).toFloat()
+                    val moving = obj.optBoolean("moving", true)
+                    val carrying = obj.optBoolean("carrying", false)
+                    val sack = obj.optBoolean("sack", false)
+                    val boost = obj.optBoolean("boost", false)
+                    val stun = obj.optBoolean("stun", false)
                     latestWorld = latestWorld.copy(
                         players = latestWorld.players.map { p ->
-                            if (p.id == peerId) p.copy(pos = Vec3(x, 0f, z), yaw = yaw, isMoving = true) else p
+                            if (p.id == senderId) {
+                                p.copy(
+                                    pos = Vec3(x, 0f, z),
+                                    yaw = yaw,
+                                    isMoving = moving,
+                                    walkPhase = if (moving) p.walkPhase + 0.35f else p.walkPhase,
+                                    isCarryingBou = carrying,
+                                    isCarriedInSack = sack,
+                                    speedBoostTimer = if (boost) 0.3f else 0f,
+                                    stunTimer = if (stun) 0.3f else 0f
+                                )
+                            } else p
                         }
                     )
                 }
