@@ -1075,8 +1075,10 @@ fun ThreeDGameViewport(
                 val screenX = rx * rightX + rz * rightZ
                 val screenY = -(rx * hFwdX + rz * hFwdZ)
                 val angle = atan2(screenY, screenX)
-                val ax = (w * 0.5f + cos(angle) * w * 0.38f).coerceIn(58f, w - 58f)
-                val ay = (h * 0.52f + sin(angle) * h * 0.34f).coerceIn(145f, h - 145f)
+                val marginX = (w * 0.08f).coerceAtMost(58f)
+                val marginY = (h * 0.16f).coerceAtMost(145f)
+                val ax = (w * 0.5f + cos(angle) * w * 0.38f).coerceIn(marginX, w - marginX)
+                val ay = (h * 0.52f + sin(angle) * h * 0.34f).coerceIn(marginY, h - marginY)
 
                 nativePath.rewind()
                 nativePath.moveTo(ax + cos(angle) * 26f, ay + sin(angle) * 26f)

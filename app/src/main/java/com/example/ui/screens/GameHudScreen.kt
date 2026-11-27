@@ -87,6 +87,7 @@ import androidx.compose.ui.input.pointer.PointerEventType
 import androidx.compose.ui.input.pointer.PointerId
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.positionChange
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -149,6 +150,8 @@ fun GameHudScreen(
 
     val world = uiState.world
     val local = world.localPlayer
+    val config = LocalConfiguration.current
+    val isCompactHeight = config.screenHeightDp < 500
 
     fun updateKeys() {
         var kx = 0f
@@ -279,7 +282,7 @@ fun GameHudScreen(
             modifier = Modifier
                 .fillMaxSize()
                 .windowInsetsPadding(WindowInsets.safeDrawing)
-                .padding(10.dp)
+                .padding(if (isCompactHeight) 8.dp else 10.dp)
         ) {
             // CLEAN 3-ROW NON-OVERLAPPING TOP HUD
             Column(
@@ -492,7 +495,7 @@ fun GameHudScreen(
                         horizontalArrangement = Arrangement.spacedBy(7.dp),
                         verticalAlignment = Alignment.Top
                     ) {
-                        TransparentVenueMiniMap(world = world)
+                        TransparentVenueMiniMap(world = world, compact = isCompactHeight)
 
                         Column(
                             modifier = Modifier.widthIn(max = 148.dp),
@@ -910,7 +913,10 @@ fun GameHudScreen(
 
                 // Responsive Virtual Thumb Joystick (disabled while Bou is inside the sack)
                 if (local?.isCarriedInSack != true) {
-                    VirtualThumbJoystick(onMove = onJoystickMove)
+                    VirtualThumbJoystick(
+                        sizeDp = if (isCompactHeight) 114 else 136,
+                        onMove = onJoystickMove
+                    )
                 }
             }
 
@@ -919,7 +925,7 @@ fun GameHudScreen(
                 Row(
                     modifier = Modifier
                         .align(Alignment.BottomEnd)
-                        .padding(bottom = 8.dp, end = 4.dp),
+                        .padding(bottom = if (isCompactHeight) 4.dp else 8.dp, end = 4.dp),
                     horizontalArrangement = Arrangement.spacedBy(12.dp),
                     verticalAlignment = Alignment.Bottom
                 ) {
@@ -946,7 +952,7 @@ fun GameHudScreen(
                             holdProgress = 0f,
                             color = MarigoldGold,
                             contentColor = MaroonNight,
-                            sizeDp = 78,
+                            sizeDp = if (isCompactHeight) 68 else 78,
                             testTag = "ability2_button",
                             isHoldButton = false,
                             onTap = onAbility2Press,
@@ -964,7 +970,7 @@ fun GameHudScreen(
                         holdProgress = local.holdProgress,
                         color = primaryMeta.color,
                         contentColor = primaryMeta.textColor,
-                        sizeDp = 96,
+                        sizeDp = if (isCompactHeight) 84 else 96,
                         testTag = "ability1_button",
                         isHoldButton = primaryMeta.isHold,
                         onTap = onAbility1Press,
@@ -1036,14 +1042,15 @@ private fun computePrimaryButtonMeta(local: PlayerEntity, world: GameWorldState)
 
 @Composable
 private fun VirtualThumbJoystick(
+    sizeDp: Int = 136,
     onMove: (Float, Float) -> Unit
 ) {
     var knobOffset by remember { mutableStateOf(Offset.Zero) }
-    val maxRadiusPx = 115f
+    val maxRadiusPx = sizeDp * 0.85f
 
     Box(
         modifier = Modifier
-            .size(136.dp)
+            .size(sizeDp.dp)
             .clip(CircleShape)
             .background(Color(0x5517070D))
             .border(1.75.dp, MarigoldGold.copy(alpha = 0.58f), CircleShape)
@@ -1248,7 +1255,7 @@ private fun InsideSackOverlay() {
 }
 
 @Composable
-private fun TransparentVenueMiniMap(world: GameWorldState) {
+private fun TransparentVenueMiniMap(world: GameWorldState, compact: Boolean = false) {
     val localPlayer = world.localPlayer
     val localRole = localPlayer?.role
     val labelPaint = remember {
@@ -1263,7 +1270,10 @@ private fun TransparentVenueMiniMap(world: GameWorldState) {
         shape = RoundedCornerShape(14.dp),
         border = BorderStroke(1.25.dp, MarigoldGold.copy(alpha = 0.65f)),
         modifier = Modifier
-            .size(width = 112.dp, height = 124.dp)
+            .size(
+                width = if (compact) 92.dp else 112.dp,
+                height = if (compact) 100.dp else 124.dp
+            )
             .testTag("venue_minimap")
     ) {
         Column(modifier = Modifier.fillMaxSize()) {
