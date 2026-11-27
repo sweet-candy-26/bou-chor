@@ -9,7 +9,6 @@ import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.AudioTrack
 import android.media.MediaRecorder
-import android.media.audiofx.AcousticEchoCanceler
 import android.util.Base64
 import android.webkit.JavascriptInterface
 import android.webkit.PermissionRequest
@@ -26,9 +25,12 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
+import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -51,11 +53,12 @@ import java.net.ServerSocket
 import java.net.Socket
 import java.util.Collections
 import java.util.UUID
+import kotlin.math.abs
 import kotlin.math.sqrt
 
 /**
  * Real Android AudioRecord live voice capture & G.711 u-law encoder.
- * Captures 8000 Hz Mono PCM-16 with AEC + automatic MIC fallback,
+ * Captures 16000 Hz Mono PCM-16 (with automatic 8000 Hz / AudioSource fallback + speech AGC boost),
  * drives Lobby/HUD mic meters, and streams compact VAD-gated u-law chunks.
  */
 class NativeMicMonitor(private val context: Context) {
@@ -63,7 +66,7 @@ class NativeMicMonitor(private val context: Context) {
     private var monitorJob: Job? = null
 
     @Volatile
-    var onEncodedVoiceFrame: ((String) -> Unit)? = null
+    var onEncodedVoiceFrame: ((base64MuLaw: String, sampleRate: Int) -> Unit)? = null
 
     private val _micLevel = MutableStateFlow(0f)
     val micLevel: StateFlow<Float> = _micLevel.asStateFlow()
@@ -85,50 +88,55 @@ class NativeMicMonitor(private val context: Context) {
         if (monitorJob?.isActive == true) return
         _isMicActive.value = true
         monitorJob = scope.launch {
-            val sampleRate = 8000
-            val frameSamples = 640 // 80ms per frame
-            val minBuf = AudioRecord.getMinBufferSize(
-                sampleRate,
-                AudioFormat.CHANNEL_IN_MONO,
-                AudioFormat.ENCODING_PCM_16BIT
-            )
-            if (minBuf <= 0) {
-                _isMicActive.value = false
-                return@launch
-            }
-            val bufBytes = maxOf(minBuf * 2, frameSamples * 4)
             var recorder: AudioRecord? = null
-            var aec: AcousticEchoCanceler? = null
+            var activeRate = 16000
+            var frameSamples = 800 // 50ms @ 16kHz (400 @ 8kHz)
             try {
-                for (source in intArrayOf(MediaRecorder.AudioSource.VOICE_COMMUNICATION, MediaRecorder.AudioSource.MIC)) {
-                    val candidate = runCatching {
+                // Prefer MIC at 16kHz (widely clear on real phones + MSI App Player/emulators),
+                // then VOICE_COMMUNICATION / 8kHz fallbacks.
+                val candidates = listOf(
+                    MediaRecorder.AudioSource.MIC to 16000,
+                    MediaRecorder.AudioSource.VOICE_COMMUNICATION to 16000,
+                    MediaRecorder.AudioSource.DEFAULT to 16000,
+                    MediaRecorder.AudioSource.MIC to 8000,
+                    MediaRecorder.AudioSource.VOICE_COMMUNICATION to 8000
+                )
+                for ((source, rate) in candidates) {
+                    val minBuf = AudioRecord.getMinBufferSize(
+                        rate,
+                        AudioFormat.CHANNEL_IN_MONO,
+                        AudioFormat.ENCODING_PCM_16BIT
+                    )
+                    if (minBuf <= 0) continue
+                    val targetFrame = if (rate >= 16000) 800 else 400
+                    val bufBytes = maxOf(minBuf * 2, targetFrame * 4)
+                    val rec = runCatching {
                         AudioRecord(
                             source,
-                            sampleRate,
+                            rate,
                             AudioFormat.CHANNEL_IN_MONO,
                             AudioFormat.ENCODING_PCM_16BIT,
                             bufBytes
                         )
                     }.getOrNull()
-                    if (candidate != null && candidate.state == AudioRecord.STATE_INITIALIZED) {
-                        val started = runCatching { candidate.startRecording(); true }.getOrDefault(false)
+                    if (rec != null && rec.state == AudioRecord.STATE_INITIALIZED) {
+                        val started = runCatching { rec.startRecording(); true }.getOrDefault(false)
                         if (started) {
-                            recorder = candidate
+                            recorder = rec
+                            activeRate = rate
+                            frameSamples = targetFrame
                             break
                         }
                     }
-                    runCatching { candidate?.release() }
+                    runCatching { rec?.release() }
                 }
                 if (recorder == null) {
                     _isMicActive.value = false
                     return@launch
                 }
-                runCatching {
-                    if (AcousticEchoCanceler.isAvailable()) {
-                        aec = AcousticEchoCanceler.create(recorder.audioSessionId)?.apply { enabled = true }
-                    }
-                }
+
                 val buffer = ShortArray(frameSamples)
+                val boostedBuf = ShortArray(frameSamples)
                 val uLawBytes = ByteArray(frameSamples)
                 var hangoverFrames = 0
                 while (isActive) {
@@ -140,32 +148,45 @@ class NativeMicMonitor(private val context: Context) {
                     }
                     if (offset > 0) {
                         var sumSq = 0.0
+                        var peakAbs = 0
                         for (i in 0 until offset) {
-                            val norm = buffer[i] / 32768.0
+                            val s = buffer[i].toInt()
+                            val a = abs(s)
+                            if (a > peakAbs) peakAbs = a
+                            val norm = s / 32768.0
                             sumSq += norm * norm
                         }
                         val rms = sqrt(sumSq / offset).toFloat()
-                        val boosted = (rms * 10.5f).coerceIn(0f, 1f)
-                        _micLevel.value = _micLevel.value * 0.42f + boosted * 0.58f
+                        val peakNorm = peakAbs / 32768f
+                        val level = maxOf(rms * 14f, peakNorm * 1.8f).coerceIn(0f, 1f)
+                        _micLevel.value = _micLevel.value * 0.40f + level * 0.60f
 
                         val callback = onEncodedVoiceFrame
                         if (callback != null && offset == frameSamples) {
-                            if (rms > 0.012f) hangoverFrames = 6
+                            // Sensitive speech detection so soft speakers / emulator mics never drop words
+                            if (rms > 0.0022f || peakNorm > 0.014f) {
+                                hangoverFrames = 10 // 500ms tail hold
+                            }
                             if (hangoverFrames > 0) {
                                 hangoverFrames--
-                                encodeMuLawFrame(buffer, uLawBytes)
+                                // Clean software AGC boost so friend's speaker plays loud & clear
+                                val maxSafeGain = if (peakNorm > 0.02f) (0.85f / peakNorm).coerceAtMost(7.0f) else 6.0f
+                                val desiredGain = (0.20f / rms.coerceAtLeast(0.004f)).coerceIn(2.0f, maxSafeGain)
+                                for (i in 0 until frameSamples) {
+                                    boostedBuf[i] = (buffer[i] * desiredGain).toInt().coerceIn(-32767, 32767).toShort()
+                                }
+                                encodeMuLawFrame(boostedBuf, uLawBytes)
                                 val b64 = Base64.encodeToString(uLawBytes, Base64.NO_WRAP)
-                                callback(b64)
+                                callback(b64, activeRate)
                             }
                         }
                     } else {
-                        delay(40)
+                        delay(25)
                     }
                 }
             } catch (_: Throwable) {
                 _micLevel.value = 0f
             } finally {
-                runCatching { aec?.release() }
                 runCatching { recorder?.stop() }
                 runCatching { recorder?.release() }
                 _micLevel.value = 0f
@@ -182,7 +203,7 @@ class NativeMicMonitor(private val context: Context) {
     }
 }
 
-private fun encodeMuLawFrame(pcm: ShortArray, out: ByteArray) {
+internal fun encodeMuLawFrame(pcm: ShortArray, out: ByteArray) {
     for (i in pcm.indices) {
         var sample = pcm[i].toInt()
         val sign = if (sample < 0) {
@@ -204,7 +225,7 @@ private fun encodeMuLawFrame(pcm: ShortArray, out: ByteArray) {
     }
 }
 
-private fun decodeMuLawFrame(uLaw: ByteArray): ShortArray {
+internal fun decodeMuLawFrame(uLaw: ByteArray): ShortArray {
     val out = ShortArray(uLaw.size)
     for (i in uLaw.indices) {
         val u = uLaw[i].toInt().inv() and 0xFF
@@ -238,6 +259,8 @@ class BouChorLanManager(
     private val onPeerDisconnected: (peerId: String) -> Unit
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    @OptIn(ExperimentalCoroutinesApi::class)
+    private val writeDispatcher = Dispatchers.IO.limitedParallelism(1)
     private var serverSocket: ServerSocket? = null
     private var udpSocket: DatagramSocket? = null
     private var clientSocket: Socket? = null
@@ -537,7 +560,7 @@ class BouChorLanManager(
     }
 
     fun broadcast(jsonString: String) {
-        scope.launch {
+        scope.launch(writeDispatcher) {
             if (isHosting) {
                 val dead = mutableListOf<Socket>()
                 synchronized(hostClientSockets) {
@@ -660,10 +683,28 @@ class PeerBridgeController(
     @Volatile
     private var nativeSpeakerMuted = false
 
+    private data class RemoteVoiceChunk(
+        val senderId: String,
+        val base64MuLaw: String,
+        val sampleRate: Int
+    )
+
     private val voiceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    @OptIn(ExperimentalCoroutinesApi::class)
+    private val voiceDispatcher = Dispatchers.IO.limitedParallelism(1)
+    private val voiceChannel = Channel<RemoteVoiceChunk>(capacity = 64, onBufferOverflow = BufferOverflow.DROP_OLDEST)
     private val remotePeerGains = Collections.synchronizedMap(mutableMapOf<String, Float>())
     private val remoteAudioTracks = Collections.synchronizedMap(mutableMapOf<String, AudioTrack>())
+    private val remoteTrackRates = Collections.synchronizedMap(mutableMapOf<String, Int>())
     private var voiceSeq = 1L
+
+    init {
+        voiceScope.launch(voiceDispatcher) {
+            for (chunk in voiceChannel) {
+                processVoiceChunkOrdered(chunk)
+            }
+        }
+    }
 
     private val lanManager = BouChorLanManager(
         localPeerId = localPeerId,
@@ -752,13 +793,14 @@ class PeerBridgeController(
         evalJs("window.BouChorNet && window.BouChorNet.broadcast($quoted);")
     }
 
-    fun broadcastVoiceFrame(base64MuLaw: String) {
+    fun broadcastVoiceFrame(base64MuLaw: String, sampleRate: Int = 16000) {
         if (!nativeMicEnabled || activeRoomCode.isEmpty()) return
         val pkt = JSONObject().apply {
             put("type", "v")
             put("senderId", localPeerId)
             put("roomCode", activeRoomCode)
             put("pktId", "${localPeerId}_v_${voiceSeq++}")
+            put("sr", sampleRate)
             put("d", base64MuLaw)
         }.toString()
         lanManager.broadcast(pkt)
@@ -782,6 +824,7 @@ class PeerBridgeController(
 
     private fun releaseRemoteTrack(peerId: String) {
         remotePeerGains.remove(peerId)
+        remoteTrackRates.remove(peerId)
         val tr = remoteAudioTracks.remove(peerId) ?: return
         runCatching { tr.stop() }
         runCatching { tr.release() }
@@ -789,6 +832,7 @@ class PeerBridgeController(
 
     private fun releaseAllRemoteTracks() {
         remotePeerGains.clear()
+        remoteTrackRates.clear()
         val snapshot = synchronized(remoteAudioTracks) {
             val list = remoteAudioTracks.values.toList()
             remoteAudioTracks.clear()
@@ -800,54 +844,68 @@ class PeerBridgeController(
         }
     }
 
-    private fun handleIncomingVoiceFrame(senderId: String, base64MuLaw: String) {
+    private fun handleIncomingVoiceFrame(senderId: String, base64MuLaw: String, sampleRate: Int) {
         if (base64MuLaw.isEmpty()) return
-        voiceScope.launch {
-            try {
-                val uLaw = Base64.decode(base64MuLaw, Base64.DEFAULT)
-                if (uLaw.isEmpty()) return@launch
-                val pcm = decodeMuLawFrame(uLaw)
-                var sumSq = 0.0
-                for (i in pcm.indices) {
-                    val n = pcm[i] / 32768.0
-                    sumSq += n * n
-                }
-                val rms = sqrt(sumSq / pcm.size).toFloat()
-                val level = (rms * 10.5f).coerceIn(0f, 1f)
-                listener.onRemoteVoiceLevel(senderId, level)
+        voiceChannel.trySend(RemoteVoiceChunk(senderId, base64MuLaw, if (sampleRate == 8000) 8000 else 16000))
+    }
 
-                val effectiveGain = if (nativeSpeakerMuted) 0f else (remotePeerGains[senderId] ?: 1f)
-                if (effectiveGain <= 0.01f) return@launch
-
-                for (i in pcm.indices) {
-                    val scaled = (pcm[i] * effectiveGain).toInt().coerceIn(-32768, 32767)
-                    pcm[i] = scaled.toShort()
-                }
-
-                val track = remoteAudioTracks[senderId] ?: synchronized(remoteAudioTracks) {
-                    remoteAudioTracks[senderId] ?: createVoiceAudioTrack().also {
-                        if (it != null) remoteAudioTracks[senderId] = it
-                    }
-                } ?: return@launch
-
-                if (track.playState != AudioTrack.PLAYSTATE_PLAYING) {
-                    runCatching { track.play() }
-                }
-                track.write(pcm, 0, pcm.size)
-            } catch (_: Throwable) {
+    private fun processVoiceChunkOrdered(chunk: RemoteVoiceChunk) {
+        try {
+            val uLaw = Base64.decode(chunk.base64MuLaw, Base64.DEFAULT)
+            if (uLaw.isEmpty()) return
+            val pcm = decodeMuLawFrame(uLaw)
+            var sumSq = 0.0
+            for (i in pcm.indices) {
+                val n = pcm[i] / 32768.0
+                sumSq += n * n
             }
+            val rms = sqrt(sumSq / pcm.size).toFloat()
+            val level = (rms * 5.5f).coerceIn(0f, 1f)
+            listener.onRemoteVoiceLevel(chunk.senderId, level)
+
+            val effectiveGain = if (nativeSpeakerMuted) 0f else (remotePeerGains[chunk.senderId] ?: 1f)
+            if (effectiveGain <= 0.01f) return
+
+            for (i in pcm.indices) {
+                val scaled = (pcm[i] * effectiveGain).toInt().coerceIn(-32768, 32767)
+                pcm[i] = scaled.toShort()
+            }
+
+            val existingRate = remoteTrackRates[chunk.senderId]
+            if (existingRate != null && existingRate != chunk.sampleRate) {
+                remoteAudioTracks.remove(chunk.senderId)?.let { oldTr ->
+                    runCatching { oldTr.stop() }
+                    runCatching { oldTr.release() }
+                }
+            }
+
+            val track = remoteAudioTracks[chunk.senderId] ?: synchronized(remoteAudioTracks) {
+                remoteAudioTracks[chunk.senderId] ?: createVoiceAudioTrack(chunk.sampleRate)?.also {
+                    remoteAudioTracks[chunk.senderId] = it
+                    remoteTrackRates[chunk.senderId] = chunk.sampleRate
+                }
+            } ?: return
+
+            if (track.playState != AudioTrack.PLAYSTATE_PLAYING) {
+                runCatching {
+                    track.setVolume(AudioTrack.getMaxVolume())
+                    track.play()
+                }
+            }
+            track.write(pcm, 0, pcm.size)
+        } catch (_: Throwable) {
         }
     }
 
-    private fun createVoiceAudioTrack(): AudioTrack? {
+    private fun createVoiceAudioTrack(sampleRate: Int): AudioTrack? {
         return runCatching {
-            val sampleRate = 8000
             val minBuf = AudioTrack.getMinBufferSize(
                 sampleRate,
                 AudioFormat.CHANNEL_OUT_MONO,
                 AudioFormat.ENCODING_PCM_16BIT
             )
             if (minBuf <= 0) return null
+            val targetBuf = maxOf(minBuf, (sampleRate / 10) * 2) // 100ms fast zero-stall playout buffer
             AudioTrack.Builder()
                 .setAudioAttributes(
                     AudioAttributes.Builder()
@@ -862,9 +920,12 @@ class PeerBridgeController(
                         .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
                         .build()
                 )
-                .setBufferSizeInBytes(maxOf(minBuf * 2, 3200))
+                .setBufferSizeInBytes(targetBuf)
                 .setTransferMode(AudioTrack.MODE_STREAM)
                 .build()
+                .apply {
+                    setVolume(AudioTrack.getMaxVolume())
+                }
         }.getOrNull()
     }
 
@@ -954,7 +1015,7 @@ class PeerBridgeController(
             }
 
             "v" -> {
-                handleIncomingVoiceFrame(senderId, obj.optString("d", ""))
+                handleIncomingVoiceFrame(senderId, obj.optString("d", ""), obj.optInt("sr", 16000))
             }
 
             "bye" -> {

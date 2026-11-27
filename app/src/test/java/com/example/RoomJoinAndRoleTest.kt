@@ -10,6 +10,8 @@ import com.example.game.Role
 import com.example.game.Team
 import com.example.game.Vec3
 import com.example.network.BouChorMqttRelayManager
+import com.example.network.decodeMuLawFrame
+import com.example.network.encodeMuLawFrame
 import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
@@ -448,5 +450,23 @@ class RoomJoinAndRoleTest {
         guestEngine.applyRemoteGameplayEvent(guestWorld, winJson)
         assertEquals("JAMAI ESCAPED WITH BOU!", guestMatchEnd?.headline)
         assertEquals(null, hostMatchEnd)
+    }
+
+    @Test
+    fun `voice mu-law codec roundtrip preserves audible speech waveform`() {
+        val pcmIn = ShortArray(800) { i ->
+            (kotlin.math.sin(i * 0.25) * 14000.0).toInt().toShort()
+        }
+        val encoded = ByteArray(pcmIn.size)
+        encodeMuLawFrame(pcmIn, encoded)
+        val decoded = decodeMuLawFrame(encoded)
+
+        assertEquals(pcmIn.size, decoded.size)
+        var maxErr = 0
+        for (i in pcmIn.indices) {
+            val err = kotlin.math.abs(pcmIn[i] - decoded[i])
+            if (err > maxErr) maxErr = err
+        }
+        assertTrue("G.711 u-law quantization error ($maxErr) must preserve voice clarity (< 600)", maxErr < 600)
     }
 }

@@ -149,14 +149,14 @@ class GameViewModel(application: Application) : AndroidViewModel(application), P
     @Volatile private var lastCarryEventMs = 0L
 
     init {
-        micMonitor.onEncodedVoiceFrame = { encodedFrame ->
+        micMonitor.onEncodedVoiceFrame = { encodedFrame, sampleRate ->
             val st = _uiState.value
             if (!st.isSoloMode &&
                 st.isMicEnabled &&
                 st.micPermissionGranted &&
-                st.lobbyPlayers.any { !it.isLocal && !it.isBot }
+                (st.isPeerConnected || st.lobbyPlayers.any { !it.isLocal && !it.isBot })
             ) {
-                peerController.broadcastVoiceFrame(encodedFrame)
+                peerController.broadcastVoiceFrame(encodedFrame, sampleRate)
             }
         }
         viewModelScope.launch {
@@ -344,6 +344,9 @@ class GameViewModel(application: Application) : AndroidViewModel(application), P
     fun returnToLobbyOrTitle() {
         stopMatchLoop()
         val st = _uiState.value
+        st.lobbyPlayers.filter { !it.isLocal && !it.isBot }.forEach {
+            peerController.updatePeerGain(it.id, 1.0f)
+        }
         if (st.isSoloMode) {
             _uiState.update { it.copy(screen = ScreenMode.Title) }
         } else {
@@ -568,7 +571,7 @@ class GameViewModel(application: Application) : AndroidViewModel(application), P
                 1.0f
             } else {
                 val dist = local.pos.dist2D(remote.pos)
-                (1f - (dist / 36f)).coerceIn(0f, 1f)
+                (1f - (dist / 110f) * 0.45f).coerceIn(0.55f, 1.0f)
             }
             peerController.updatePeerGain(remote.id, gain)
         }

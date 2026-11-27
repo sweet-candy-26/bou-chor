@@ -35,6 +35,8 @@ class BouChorMqttRelayManager(
     )
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    private val publishDispatcher = Dispatchers.IO.limitedParallelism(1)
     private val writeLock = Any()
 
     private var connectionJob: Job? = null
@@ -91,7 +93,7 @@ class BouChorMqttRelayManager(
         val code = currentRoomCode
         if (code.isBlank() || code.contains(".") || !isSubscribed) return
         val out = activeOut ?: return
-        scope.launch {
+        scope.launch(publishDispatcher) {
             sendPublish(out, topicForRoom(code), jsonPayload)
         }
     }
