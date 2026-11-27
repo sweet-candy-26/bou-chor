@@ -63,7 +63,7 @@ enum class Role(
         baseSpeed = 10.7f,
         ability1Name = "DASH",
         ability2Name = "BANANA",
-        shortGoal = "Dash (Sprint Boost), drop Bananas, Sack Bou (1.3s hold) & escape!"
+        shortGoal = "Dash, drop Bananas, Slow Mama 5s (1x), Sack Bou (1.3s) & escape!"
     ),
     BOR(
         displayName = "BOR",
@@ -72,9 +72,9 @@ enum class Role(
         team = Team.WEDDING,
         accentColor = BorGold,
         baseSpeed = 10.1f,
-        ability1Name = "RESCUE",
+        ability1Name = "CARRY/RESCUE",
         ability2Name = "GUARD",
-        shortGoal = "Guard Bou (Speed+Shield), boost tasks 1.6x, or Rescue her from Chor!"
+        shortGoal = "Carry Bou into any Vehicle for 3s to WIN, Guard her, or Rescue from Chor!"
     ),
     MAMA(
         displayName = "MAMA",
@@ -106,7 +106,9 @@ enum class HoldActionType {
     NONE,
     KIDNAP,
     ESCAPE,
-    RESCUE
+    RESCUE,
+    PICKUP_BOU,
+    BOR_ESCAPE
 }
 
 data class PlayerEntity(
@@ -129,6 +131,7 @@ data class PlayerEntity(
     val swingAnim: Float = 0f,
     val isCarryingBou: Boolean = false,
     val isCarriedInSack: Boolean = false,
+    val isCarriedByBor: Boolean = false,
     val kidnapImmunityTimer: Float = 0f,
     val ability1Cooldown: Float = 0f,
     val ability1MaxCooldown: Float = 1f,
@@ -143,7 +146,9 @@ data class PlayerEntity(
     val campAnchorZ: Float = 0f,
     val campTimer: Float = 0f,
     val auraExposed: Boolean = false,
-    val speedBoostTimer: Float = 0f
+    val speedBoostTimer: Float = 0f,
+    val slowTimer: Float = 0f,
+    val mamaSlowUsed: Boolean = false
 ) {
     val isIncapacitated: Boolean get() = stunTimer > 0f || slipTimer > 0f
 }

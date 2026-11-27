@@ -132,6 +132,7 @@ fun GameHudScreen(
     onAbility1Press: () -> Unit,
     onAbility1HoldChanged: (Boolean) -> Unit,
     onAbility2Press: () -> Unit,
+    onAbility3Press: () -> Unit,
     onToggleMic: () -> Unit,
     onToggleSpeaker: () -> Unit,
     onToggleTeamRadio: () -> Unit,
@@ -182,6 +183,10 @@ fun GameHudScreen(
                     }
                     Key.F -> {
                         if (isDown) onAbility2Press()
+                        true
+                    }
+                    Key.Q -> {
+                        if (isDown) onAbility3Press()
                         true
                     }
                     Key.Enter -> {
@@ -258,6 +263,29 @@ fun GameHudScreen(
         // 2. Funny Semi-Dark "INSIDE SACK!" Overlay when Bou is carried by Bou Chor!
         if (local?.role == Role.BOU && local.isCarriedInSack) {
             InsideSackOverlay()
+        }
+
+        // 2b. Celebratory Bidayi Banner when Jamai is carrying Bou to the getaway car!
+        if (local?.role == Role.BOU && local.isCarriedByBor) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = if (isCompactHeight) 62.dp else 74.dp),
+                contentAlignment = Alignment.TopCenter
+            ) {
+                Surface(
+                    color = Color(0xDD2A120A),
+                    shape = RoundedCornerShape(16.dp),
+                    border = BorderStroke(1.75.dp, MarigoldGold)
+                ) {
+                    Text(
+                        text = "IN JAMAI'S ARMS! Hold at car 3s to win or tap [E] to hop off!",
+                        style = MaterialTheme.typography.labelLarge,
+                        color = MarigoldGold,
+                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 7.dp)
+                    )
+                }
+            }
         }
 
         // 3. Blinding White Camera Flash Overlay (2.5s fade) when Bou Chor is flashed by Photographer!
@@ -555,6 +583,15 @@ fun GameHudScreen(
                                             style = MaterialTheme.typography.labelSmall,
                                             fontSize = 9.sp,
                                             color = BridalCrimson,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                    } else if (world.players.any { it.role == Role.BOR && it.isCarryingBou }) {
+                                        Text(
+                                            text = "JAMAI CARRYING BOU!",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            fontSize = 9.sp,
+                                            color = MarigoldGold,
                                             maxLines = 1,
                                             overflow = TextOverflow.Ellipsis
                                         )
@@ -911,8 +948,8 @@ fun GameHudScreen(
                     }
                 }
 
-                // Responsive Virtual Thumb Joystick (disabled while Bou is inside the sack)
-                if (local?.isCarriedInSack != true) {
+                // Responsive Virtual Thumb Joystick (disabled while Bou is inside the sack or carried by Jamai)
+                if (local?.isCarriedInSack != true && local?.isCarriedByBor != true) {
                     VirtualThumbJoystick(
                         sizeDp = if (isCompactHeight) 114 else 136,
                         onMove = onJoystickMove
@@ -929,6 +966,26 @@ fun GameHudScreen(
                     horizontalArrangement = Arrangement.spacedBy(12.dp),
                     verticalAlignment = Alignment.Bottom
                 ) {
+                    // Chor 1x-per-match Mama Slow hex
+                    if (local.role == Role.BOU_CHOR) {
+                        val spent = local.mamaSlowUsed
+                        TactileActionButton(
+                            label = if (spent) "USED" else "SLOW MAMA",
+                            subLabel = if (spent) "1x SPENT" else "5s 1x [Q]",
+                            cooldown = 0f,
+                            maxCooldown = 1f,
+                            holdProgress = 0f,
+                            color = if (spent) ChorCharcoal else Color(0xFF9333EA),
+                            contentColor = WarmIvory,
+                            sizeDp = if (isCompactHeight) 68 else 78,
+                            testTag = "ability3_button",
+                            isHoldButton = false,
+                            enabled = !spent,
+                            onTap = onAbility3Press,
+                            onHoldChanged = {}
+                        )
+                    }
+
                     // Ability 2 (Sandal for Bou, Banana Peel for Bou Chor, Guard/Sprint for Bor)
                     val a2Name = local.role.ability2Name
                     if (a2Name != null && !local.isCarriedInSack) {
@@ -1015,7 +1072,10 @@ private data class PrimaryActionMeta(
 
 private fun computePrimaryButtonMeta(local: PlayerEntity, world: GameWorldState): PrimaryActionMeta {
     return when (local.role) {
-        Role.BOU -> PrimaryActionMeta("SCREAM!", "ALERT [E]", BridalCrimson, WarmIvory, false)
+        Role.BOU -> {
+            if (local.isCarriedByBor) PrimaryActionMeta("HOP OFF", "TAP [E]", MarigoldGold, MaroonNight, false)
+            else PrimaryActionMeta("SCREAM!", "ALERT [E]", BridalCrimson, WarmIvory, false)
+        }
         Role.BOU_CHOR -> {
             val bou = world.players.firstOrNull { it.role == Role.BOU }
             val distBou = if (bou != null) local.pos.dist2D(bou.pos) else 99f
@@ -1034,7 +1094,26 @@ private fun computePrimaryButtonMeta(local: PlayerEntity, world: GameWorldState)
                 PrimaryActionMeta("DASH!", "SPEED BOOST", ChorCharcoal, WarmIvory, false)
             }
         }
-        Role.BOR -> PrimaryActionMeta("RESCUE", "HOLD 1.5s", CngEmerald, MaroonNight, true)
+        Role.BOR -> {
+            val chor = world.chorPlayer
+            val bou = world.bouPlayer
+            when {
+                chor?.isCarryingBou == true -> PrimaryActionMeta("RESCUE", "HOLD 1.5s", CngEmerald, MaroonNight, true)
+                local.isCarryingBou -> {
+                    val nearGate = world.gates.any { local.pos.dist2D(it.pos) <= it.radius }
+                    PrimaryActionMeta(
+                        label = if (nearGate) "GET IN CAR!" else "TO VEHICLE",
+                        subLabel = if (nearGate) "HOLD 3.0s" else "CARRYING BOU",
+                        color = if (nearGate) CngEmerald else MarigoldGold,
+                        textColor = MaroonNight,
+                        isHold = true
+                    )
+                }
+                bou != null && !bou.isCarriedInSack && !bou.isCarriedByBor && local.pos.dist2D(bou.pos) <= 3.8f ->
+                    PrimaryActionMeta("CARRY BOU", "HOLD 0.8s", MarigoldGold, MaroonNight, true)
+                else -> PrimaryActionMeta("RESCUE", "HOLD 1.5s", CngEmerald, MaroonNight, true)
+            }
+        }
         Role.MAMA -> PrimaryActionMeta("BASH!", "DHISHUM!", MamaOrange, WarmIvory, false)
         Role.PHOTOGRAPHER -> PrimaryActionMeta("FLASH!", "BLIND 2.5s", FairyCyan, MaroonNight, false)
     }
@@ -1116,10 +1195,12 @@ private fun TactileActionButton(
     sizeDp: Int,
     testTag: String,
     isHoldButton: Boolean,
+    enabled: Boolean = true,
     onTap: () -> Unit,
     onHoldChanged: (Boolean) -> Unit
 ) {
     val onCooldown = cooldown > 0.05f
+    val inactive = onCooldown || !enabled
     val cooldownFraction = if (onCooldown && maxCooldown > 0.05f) {
         (cooldown / maxCooldown).coerceIn(0f, 1f)
     } else 0f
@@ -1128,15 +1209,16 @@ private fun TactileActionButton(
         modifier = Modifier
             .size(sizeDp.dp)
             .clip(CircleShape)
-            .background(if (onCooldown) Color(0x991B0C14) else color.copy(alpha = 0.92f))
+            .background(if (inactive) Color(0x991B0C14) else color.copy(alpha = 0.92f))
             .border(
                 width = 2.5.dp,
-                color = if (onCooldown) WarmIvory.copy(alpha = 0.25f) else WarmIvory.copy(alpha = 0.88f),
+                color = if (inactive) WarmIvory.copy(alpha = 0.25f) else WarmIvory.copy(alpha = 0.88f),
                 shape = CircleShape
             )
-            .pointerInput(isHoldButton, onCooldown) {
+            .pointerInput(isHoldButton, onCooldown, enabled) {
                 detectTapGestures(
                     onPress = {
+                        if (!enabled) return@detectTapGestures
                         if (isHoldButton) {
                             onHoldChanged(true)
                             tryAwaitRelease()

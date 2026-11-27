@@ -5,7 +5,9 @@ import androidx.test.core.app.ApplicationProvider
 import com.example.audio.SoundEngine
 import com.example.game.GameEngine
 import com.example.game.LobbyPlayer
+import com.example.game.MatchResult
 import com.example.game.Role
+import com.example.game.Team
 import com.example.game.Vec3
 import com.example.network.BouChorMqttRelayManager
 import org.json.JSONArray
@@ -154,5 +156,202 @@ class RoomJoinAndRoleTest {
             guestRelay.stopAll()
             hostRelay.stopAll()
         }
+    }
+
+    @Test
+    fun `chor slows mama for 5s only once per entire match`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val engine = GameEngine(
+            soundEngine = SoundEngine(context),
+            onBotChat = { _, _, _ -> },
+            onMatchFinished = { _ -> }
+        )
+
+        val lobby = listOf(
+            LobbyPlayer("host_chor", "ChorUser", isHost = true, isLocal = true)
+        )
+        engine.setPresetMultiplayerRoles(mapOf("host_chor" to Role.BOU_CHOR))
+        var world = engine.createInitialWorld(lobby, isSoloMode = false, roomCode = "S51")
+
+        // First activation: Chor slows Mama for 5.0 seconds
+        world = engine.step(
+            world = world,
+            dt = 0.05f,
+            moveInputX = 0f,
+            moveInputZ = 0f,
+            targetCameraYaw = 0f,
+            targetCameraPitch = 0.6f,
+            targetCameraDist = 14f,
+            ability1Pressed = false,
+            ability1Held = false,
+            ability2Pressed = false,
+            ability3Pressed = true,
+            localMicLevel = 0f,
+            allowRandomWeatherTransition = false
+        )
+
+        val chorAfterFirst = world.players.first { it.role == Role.BOU_CHOR }
+        val mamaAfterFirst = world.players.first { it.role == Role.MAMA }
+        assertTrue("Chor mamaSlowUsed flag must lock after first use", chorAfterFirst.mamaSlowUsed)
+        assertTrue("Mama must be slowed (~5.0s)", mamaAfterFirst.slowTimer > 4.8f && mamaAfterFirst.slowTimer <= 5.0f)
+
+        // Advance 5.1s so slowTimer drains completely
+        repeat(102) {
+            world = engine.step(
+                world = world,
+                dt = 0.05f,
+                moveInputX = 0f,
+                moveInputZ = 0f,
+                targetCameraYaw = 0f,
+                targetCameraPitch = 0.6f,
+                targetCameraDist = 14f,
+                ability1Pressed = false,
+                ability1Held = false,
+                ability2Pressed = false,
+                ability3Pressed = false,
+                localMicLevel = 0f,
+                allowRandomWeatherTransition = false
+            )
+        }
+
+        val mamaAfterExpiry = world.players.first { it.role == Role.MAMA }
+        assertEquals(0f, mamaAfterExpiry.slowTimer, 0.001f)
+
+        // Attempt second activation in the same match -> must be blocked
+        world = engine.step(
+            world = world,
+            dt = 0.05f,
+            moveInputX = 0f,
+            moveInputZ = 0f,
+            targetCameraYaw = 0f,
+            targetCameraPitch = 0.6f,
+            targetCameraDist = 14f,
+            ability1Pressed = false,
+            ability1Held = false,
+            ability2Pressed = false,
+            ability3Pressed = true,
+            localMicLevel = 0f,
+            allowRandomWeatherTransition = false
+        )
+
+        val mamaAfterSecondTry = world.players.first { it.role == Role.MAMA }
+        assertEquals("Second Mama slow in same match must remain blocked", 0f, mamaAfterSecondTry.slowTimer, 0.001f)
+    }
+
+    @Test
+    fun `jamai picks up bou and holds 3s in getaway car for wedding win`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        var matchResult: MatchResult? = null
+        val engine = GameEngine(
+            soundEngine = SoundEngine(context),
+            onBotChat = { _, _, _ -> },
+            onMatchFinished = { res -> if (matchResult == null) matchResult = res }
+        )
+
+        val lobby = listOf(
+            LobbyPlayer("host_bor", "JamaiHero", isHost = true, isLocal = true)
+        )
+        engine.setPresetMultiplayerRoles(mapOf("host_bor" to Role.BOR))
+        var world = engine.createInitialWorld(lobby, isSoloMode = false, roomCode = "B3S")
+
+        // Place Bor right next to Bou
+        val bouStart = world.players.first { it.role == Role.BOU }.pos
+        world = world.copy(
+            players = world.players.map {
+                if (it.role == Role.BOR) it.copy(pos = Vec3(bouStart.x + 1.2f, 0f, bouStart.z)) else it
+            }
+        )
+
+        // Hold Ability 1 for 0.9s (> 0.8s threshold) to lift Bou into Jamai's arms
+        repeat(18) {
+            world = engine.step(
+                world = world,
+                dt = 0.05f,
+                moveInputX = 0f,
+                moveInputZ = 0f,
+                targetCameraYaw = 0f,
+                targetCameraPitch = 0.6f,
+                targetCameraDist = 14f,
+                ability1Pressed = false,
+                ability1Held = true,
+                ability2Pressed = false,
+                ability3Pressed = false,
+                localMicLevel = 0f,
+                allowRandomWeatherTransition = false
+            )
+        }
+
+        val borCarrying = world.players.first { it.role == Role.BOR }
+        val bouCarried = world.players.first { it.role == Role.BOU }
+        assertTrue("Bor should be carrying Bou after 0.8s hold", borCarrying.isCarryingBou)
+        assertTrue("Bou should have isCarriedByBor set", bouCarried.isCarriedByBor)
+
+        // Release hold briefly, position Bor carrying Bou inside CNG Escape Gate, then hold 3.1s
+        world = engine.step(
+            world = world,
+            dt = 0.05f,
+            moveInputX = 0f,
+            moveInputZ = 0f,
+            targetCameraYaw = 0f,
+            targetCameraPitch = 0.6f,
+            targetCameraDist = 14f,
+            ability1Pressed = false,
+            ability1Held = false,
+            ability2Pressed = false,
+            ability3Pressed = false,
+            localMicLevel = 0f,
+            allowRandomWeatherTransition = false
+        )
+
+        val gatePos = world.gates.first().pos
+        world = world.copy(
+            players = world.players.map {
+                if (it.role == Role.BOR || it.role == Role.BOU) it.copy(pos = gatePos) else it
+            }
+        )
+
+        // Check that 2.0s hold is NOT enough yet (requires full 3.0s)
+        repeat(40) {
+            world = engine.step(
+                world = world,
+                dt = 0.05f,
+                moveInputX = 0f,
+                moveInputZ = 0f,
+                targetCameraYaw = 0f,
+                targetCameraPitch = 0.6f,
+                targetCameraDist = 14f,
+                ability1Pressed = false,
+                ability1Held = true,
+                ability2Pressed = false,
+                ability3Pressed = false,
+                localMicLevel = 0f,
+                allowRandomWeatherTransition = false
+            )
+        }
+        assertEquals("Match must still be ongoing at 2.0s sit", null, matchResult)
+
+        // Continue holding another 1.15s (total > 3.0s) to trigger Jamai Bidayi victory!
+        repeat(23) {
+            world = engine.step(
+                world = world,
+                dt = 0.05f,
+                moveInputX = 0f,
+                moveInputZ = 0f,
+                targetCameraYaw = 0f,
+                targetCameraPitch = 0.6f,
+                targetCameraDist = 14f,
+                ability1Pressed = false,
+                ability1Held = true,
+                ability2Pressed = false,
+                ability3Pressed = false,
+                localMicLevel = 0f,
+                allowRandomWeatherTransition = false
+            )
+        }
+
+        val finalRes = matchResult
+        assertTrue("Jamai escaping in car after 3s hold must end match", finalRes != null)
+        assertEquals(Team.WEDDING, finalRes!!.winningTeam)
+        assertEquals("JAMAI ESCAPED WITH BOU!", finalRes.headline)
     }
 }

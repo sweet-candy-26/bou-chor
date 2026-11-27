@@ -54,6 +54,7 @@ fun ThreeDGameViewport(
     val strokePaint = remember { Paint().apply { style = Paint.Style.STROKE; strokeWidth = 1.4f } }
     val bulbPaint = remember { Paint().apply { style = Paint.Style.FILL; isAntiAlias = true } }
     val rainPaint = remember { Paint().apply { style = Paint.Style.STROKE; strokeWidth = 1.8f; strokeCap = Paint.Cap.ROUND } }
+    val overlayStrokePaint = remember { Paint().apply { style = Paint.Style.STROKE; isAntiAlias = true; strokeCap = Paint.Cap.ROUND } }
 
     val labelPaint = remember {
         Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -106,6 +107,28 @@ fun ThreeDGameViewport(
                 2 -> 1.15f + Random.nextFloat() * 0.95f
                 3 -> 22f + Random.nextFloat() * 26f
                 else -> 0.22f + Random.nextFloat() * 0.32f
+            }
+        }
+    }
+    // Floating marigold/rose petals around Grand Stage & courtyard (x, z, phase, speed)
+    val petalSeeds = remember {
+        FloatArray(28 * 4) { idx ->
+            when (idx % 4) {
+                0 -> (Random.nextFloat() - 0.5f) * 44f
+                1 -> -22f + Random.nextFloat() * 52f
+                2 -> Random.nextFloat() * 6.28f
+                else -> 0.45f + Random.nextFloat() * 0.65f
+            }
+        }
+    }
+    // Warm fireflies hovering in Biye Bari lawn & around fairy gates (x, z, phase, freq)
+    val fireflySeeds = remember {
+        FloatArray(24 * 4) { idx ->
+            when (idx % 4) {
+                0 -> (Random.nextFloat() - 0.5f) * 76f
+                1 -> 10f + Random.nextFloat() * 44f
+                2 -> Random.nextFloat() * 6.28f
+                else -> 1.2f + Random.nextFloat() * 2.1f
             }
         }
     }
@@ -417,13 +440,44 @@ fun ThreeDGameViewport(
             czCarpet += 5f
         }
 
+        // Wet-sheen reflection pools on courtyard & road when Monsoon Rain is active
+        if (rainI > 0.12f) {
+            val puddleAlpha = ((rainI * 0.22f * 255f).toInt().coerceIn(0, 80)) shl 24
+            drawGroundCircleFast(-14f, 0.02f, 28f, 4.6f, puddleAlpha or 0x38BDF8, filled = true, hiDetail = false)
+            drawGroundCircleFast(16f, 0.02f, 32f, 5.2f, puddleAlpha or 0x7DD3FC, filled = true, hiDetail = false)
+            drawGroundCircleFast(0f, 0.02f, 48f, 6.0f, puddleAlpha or 0xFFCF66, filled = true, hiDetail = false)
+            drawGroundCircleFast(-28f, 0.02f, 42f, 4.4f, puddleAlpha or 0x38BDF8, filled = true, hiDetail = false)
+        }
+
         // Lightweight Baked Floor Pools (No PointLights!), Task Rings, Escape Rings, Shockwaves & Rain Ripples
         val pulse = 0.5f + 0.5f * sin(world.elapsedTimeSec * 4.5f)
         drawGroundCircleFast(VenueMap.STAGE_TASK_POS.x, 0f, VenueMap.STAGE_TASK_POS.z, 7.2f, 0x26FFD166, filled = true)
+        drawGroundCircleFast(VenueMap.STAGE_TASK_POS.x, 0.01f, VenueMap.STAGE_TASK_POS.z, 4.4f, 0x20FFCF66, filled = true)
         for (i in VenueMap.streetLamps.indices) {
             val lamp = VenueMap.streetLamps[i]
             drawGroundCircleFast(lamp.x, 0f, lamp.z, 5.8f, 0x22FFD875, filled = true)
         }
+        // Subtle volumetric overhead spotlight cones at Grand Stage & Biye Bari Gate
+        fun drawSpotlightBeam(wx: Float, wz: Float, topH: Float, rad: Float, rgb: Int, alpha: Float) {
+            if (projectInline(wx, topH, wz)) {
+                val tx0 = pxOut; val ty0 = pyOut
+                if (projectInline(wx - rad, 0.08f, wz + rad * 0.35f)) {
+                    val lx0 = pxOut; val ly0 = pyOut
+                    if (projectInline(wx + rad, 0.08f, wz - rad * 0.35f)) {
+                        nativePath.rewind()
+                        nativePath.moveTo(tx0, ty0)
+                        nativePath.lineTo(lx0, ly0)
+                        nativePath.lineTo(pxOut, pyOut)
+                        nativePath.close()
+                        fillPaint.color = (((alpha * 255f).toInt().coerceIn(0, 90)) shl 24) or rgb
+                        nativeCanvas.drawPath(nativePath, fillPaint)
+                    }
+                }
+            }
+        }
+        drawSpotlightBeam(VenueMap.STAGE_TASK_POS.x, VenueMap.STAGE_TASK_POS.z, 11.5f, 4.2f, 0xFFE066, if (isHd) 0.11f else 0.07f)
+        drawSpotlightBeam(0f, 22f, 10.5f, 3.6f, 0xFFB703, if (isHd) 0.09f else 0.06f)
+
         for (i in world.tasks.indices) {
             val task = world.tasks[i]
             val fillA = ((0.16f + 0.09f * pulse) * 255f).toInt() shl 24
@@ -432,6 +486,7 @@ fun ThreeDGameViewport(
             drawGroundCircleFast(task.pos.x, 0f, task.pos.z, task.radius, 0xE6000000.toInt() or rgb, filled = false, strokeW = 4f)
         }
         val chorCarrying = world.chorPlayer?.isCarryingBou == true
+        val borCarrying = world.players.any { it.role == Role.BOR && it.isCarryingBou }
         for (i in world.gates.indices) {
             val gate = world.gates[i]
             val rgb = when (gate.type) {
@@ -439,9 +494,10 @@ fun ThreeDGameViewport(
                 VehicleType.MICROBUS -> 0x38BDF8
                 VehicleType.RICKSHAW -> 0xFFB703
             }
-            val alpha = if (chorCarrying) 0.28f + 0.22f * pulse else 0.14f
+            val anyCarrying = chorCarrying || borCarrying
+            val alpha = if (anyCarrying) 0.28f + 0.22f * pulse else 0.14f
             drawGroundCircleFast(gate.pos.x, 0f, gate.pos.z, gate.radius, ((alpha * 255f).toInt() shl 24) or rgb, filled = true)
-            drawGroundCircleFast(gate.pos.x, 0f, gate.pos.z, gate.radius, 0xFF000000.toInt() or rgb, filled = false, strokeW = if (chorCarrying) 5.5f else 3.2f)
+            drawGroundCircleFast(gate.pos.x, 0f, gate.pos.z, gate.radius, 0xFF000000.toInt() or rgb, filled = false, strokeW = if (anyCarrying) 5.5f else 3.2f)
         }
         // Lightweight Circular Blob Shadows beneath all 3 Escape Vehicles!
         drawBlobShadow(-44.0f, 57.2f, 3.0f)  // Green CNG Auto-Rickshaw
@@ -500,10 +556,20 @@ fun ThreeDGameViewport(
         // 4. LIGHTWEIGHT BLOB SHADOWS & LOCAL PLAYER FOOT DIRECTIONAL OBJECTIVE RING
         for (i in world.players.indices) {
             val p = world.players[i]
-            if (p.isCarriedInSack) continue
+            if (p.isCarriedInSack || p.isCarriedByBor) continue
             drawBlobShadow(p.pos.x, p.pos.z, 0.92f)
             val ringArgb = if (p.isLocal) 0xDDFFD166.toInt() else (0xCC000000.toInt() or (p.role.accentColor.toArgb() and 0x00FFFFFF))
             drawGroundCircleFast(p.pos.x, 0.03f, p.pos.z, 1.08f, ringArgb, filled = false, strokeW = if (p.isLocal) 4.2f else 2.8f, hiDetail = p.isLocal)
+            if (p.role == Role.BOU && p.kidnapImmunityTimer > 0f) {
+                val shieldAlpha = ((0.55f + 0.35f * pulse) * 255f).toInt() shl 24
+                drawGroundCircleFast(p.pos.x, 0.04f, p.pos.z, 1.55f, shieldAlpha or 0xFFD166, filled = false, strokeW = 4.6f, hiDetail = true)
+                drawGroundCircleFast(p.pos.x, 0.04f, p.pos.z, 1.82f, 0x44FFF3B0, filled = false, strokeW = 2.4f, hiDetail = false)
+            }
+            if (p.slowTimer > 0f) {
+                val slowAlpha = ((0.6f + 0.3f * pulse) * 255f).toInt() shl 24
+                drawGroundCircleFast(p.pos.x, 0.04f, p.pos.z, 1.48f, slowAlpha or 0xA855F7, filled = false, strokeW = 4.6f, hiDetail = true)
+                drawGroundCircleFast(p.pos.x, 0.02f, p.pos.z, 1.35f, 0x33C084FC, filled = true, hiDetail = false)
+            }
 
             if (p.isLocal) {
                 drawGroundCircleFast(p.pos.x, 0.03f, p.pos.z, 1.48f, 0x44FFD166, filled = false, strokeW = 2.2f, hiDetail = true)
@@ -538,6 +604,25 @@ fun ThreeDGameViewport(
                             }
                         } else {
                             world.bouPlayer?.let { objX = it.pos.x; objZ = it.pos.z; objArgb = 0xFFFF2A55.toInt() }
+                        }
+                    }
+                    Role.BOR -> {
+                        if (p.isCarryingBou) {
+                            val nearestGate = world.gates.minByOrNull { it.pos.dist2D(p.pos) }
+                            if (nearestGate != null) {
+                                objX = nearestGate.pos.x; objZ = nearestGate.pos.z
+                                objArgb = 0xFF00E676.toInt()
+                            }
+                        } else {
+                            val sb = world.screamBeacon
+                            val chorP = world.chorPlayer
+                            when {
+                                sb != null -> { objX = sb.pos.x; objZ = sb.pos.z; objArgb = 0xFFFF1744.toInt() }
+                                chorP != null && (chorP.isCarryingBou || chorP.wallHackTimer > 0f) -> {
+                                    objX = chorP.pos.x; objZ = chorP.pos.z; objArgb = 0xFFFF1744.toInt()
+                                }
+                                else -> world.bouPlayer?.let { objX = it.pos.x; objZ = it.pos.z; objArgb = 0xFFFFD166.toInt() }
+                            }
                         }
                     }
                     Role.BOU -> {
@@ -711,7 +796,7 @@ fun ThreeDGameViewport(
         val skin = Color(0xFFD99B66)
         for (i in world.players.indices) {
             val p = world.players[i]
-            if (p.isCarriedInSack) continue
+            if (p.isCarriedInSack || p.isCarriedByBor) continue
 
             val speedRatio = (p.currentSpeed / p.role.baseSpeed).coerceIn(0f, 1f)
             val bounce = if (p.isMoving) abs(sin(p.walkPhase)) * 0.22f * speedRatio else sin(world.elapsedTimeSec * 2.4f) * 0.04f
@@ -766,8 +851,21 @@ fun ThreeDGameViewport(
                     addPart(0f, 1.18f, 0f, 0.88f, 1.12f, 0.58f, Color(0xFFF59E0B), Color(0xFFFFD166))
                     addPart(0f, 1.48f, 0.28f, 0.68f, 0.24f, 0.2f, Color(0xFFD91E43))
                     addPart(0.32f, 1.12f, -0.34f - speedRatio * 0.2f, 0.26f, 0.72f, 0.16f, Color(0xFFD91E43))
-                    addPart(-0.56f, 1.2f, armSwing, 0.24f, 0.68f, 0.24f, Color(0xFFF59E0B))
-                    addPart(0.56f, 1.2f, -armSwing, 0.24f, 0.68f, 0.24f, Color(0xFFF59E0B))
+                    if (p.isCarryingBou) {
+                        // Arms held forward cradling Bou in bridal saree!
+                        addPart(-0.48f, 1.24f, 0.42f, 0.24f, 0.26f, 0.74f, Color(0xFFF59E0B))
+                        addPart(0.48f, 1.24f, 0.42f, 0.24f, 0.26f, 0.74f, Color(0xFFF59E0B))
+                        // Bou cradled horizontally/seated in Jamai's arms (facing sideways/up)
+                        val sway = sin(world.elapsedTimeSec * 7f) * 0.04f
+                        addPart(0f, 1.22f + sway, 0.64f, 1.05f, 0.52f, 0.66f, Color(0xFFD91E43), Color(0xFFFFB703))
+                        addPart(0.18f, 1.38f + sway, 0.66f, 0.56f, 0.46f, 0.52f, Color(0xFFFF2A55), Color(0xFFFFD166))
+                        addPart(0.48f, 1.56f + sway, 0.68f, 0.48f, 0.48f, 0.48f, skin)
+                        addPart(0.52f, 1.84f + sway, 0.68f, 0.52f, 0.20f, 0.52f, Color(0xFFFFB703), Color(0xFFFFE066))
+                        addPart(-0.32f, 1.34f + sway, 0.72f, 0.64f, 0.22f, 0.70f, Color(0xFFE63946), Color(0xFFFFB703))
+                    } else {
+                        addPart(-0.56f, 1.2f, armSwing, 0.24f, 0.68f, 0.24f, Color(0xFFF59E0B))
+                        addPart(0.56f, 1.2f, -armSwing, 0.24f, 0.68f, 0.24f, Color(0xFFF59E0B))
+                    }
                     addPart(0f, 2.02f, 0f, 0.58f, 0.58f, 0.58f, skin)
                     addPart(0f, 2.46f, 0f, 0.78f, 0.46f, 0.78f, Color(0xFFD91E43), Color(0xFFFFB703))
                     addPart(0f, 2.84f, 0.2f, 0.18f, 0.42f, 0.18f, Color(0xFFFFF6EA))
@@ -855,6 +953,36 @@ fun ThreeDGameViewport(
             }
             bulbPaint.color = ((((0.85f + twinkle * 0.15f) * 255f).toInt()) shl 24) or rgb
             nativeCanvas.drawCircle(pxOut, pyOut, r, bulbPaint)
+        }
+
+        // 8b. FLOATING MARIGOLD PETALS & COURTYARD FIREFLIES (Zero-GC atmospheric polish)
+        val tAnim = world.elapsedTimeSec
+        val petalCount = if (isHd) 28 else 14
+        for (i in 0 until petalCount) {
+            val base = i * 4
+            val pxW = petalSeeds[base] + sin(tAnim * 1.4f + petalSeeds[base + 2]) * 1.6f
+            val pzW = petalSeeds[base + 1] + cos(tAnim * 1.1f + petalSeeds[base + 2]) * 1.3f
+            val cycleH = 5.4f - ((tAnim * petalSeeds[base + 3] + petalSeeds[base + 2]) % 5.1f)
+            if (projectInline(pxW, cycleH.coerceAtLeast(0.18f), pzW)) {
+                val pr = (26f / pzOut).coerceIn(2.2f, 6.2f)
+                bulbPaint.color = if ((i and 1) == 0) 0xCCFFB703.toInt() else 0xCCF43F5E.toInt()
+                nativeCanvas.drawCircle(pxOut, pyOut, pr, bulbPaint)
+            }
+        }
+        val fireflyCount = if (isHd) 24 else 12
+        for (i in 0 until fireflyCount) {
+            val base = i * 4
+            val fxW = fireflySeeds[base] + sin(tAnim * 0.9f + fireflySeeds[base + 2]) * 2.2f
+            val fzW = fireflySeeds[base + 1] + cos(tAnim * 0.75f + fireflySeeds[base + 2]) * 2.0f
+            val fyW = 1.1f + 0.9f * sin(tAnim * 1.6f + fireflySeeds[base + 2])
+            if (projectInline(fxW, fyW, fzW)) {
+                val glow = 0.35f + 0.65f * (0.5f + 0.5f * sin(tAnim * fireflySeeds[base + 3] + fireflySeeds[base + 2]))
+                val fr = (30f / pzOut).coerceIn(2.0f, 5.5f)
+                bulbPaint.color = (((glow * 0.34f * 255f).toInt()) shl 24) or 0xFFE066
+                nativeCanvas.drawCircle(pxOut, pyOut, fr * 2.5f, bulbPaint)
+                bulbPaint.color = (((glow * 0.92f * 255f).toInt()) shl 24) or 0xFFF3B0
+                nativeCanvas.drawCircle(pxOut, pyOut, fr, bulbPaint)
+            }
         }
 
         // 9. THROUGH-WALLS REVEAL HIGHLIGHTS
@@ -953,15 +1081,16 @@ fun ThreeDGameViewport(
         val nameplateMaxDist = (62f - effectiveFog * 38f - effectiveRain * 10f).coerceAtLeast(19f)
         for (i in world.players.indices) {
             val p = world.players[i]
-            if (p.isCarriedInSack && p.speechBubbleText == null) continue
-            val headY = if (p.isCarriedInSack) 3.4f else 3.05f
+            val carried = p.isCarriedInSack || p.isCarriedByBor
+            if (carried && p.speechBubbleText == null) continue
+            val headY = if (carried) 3.4f else 3.05f
             if (!projectInline(p.pos.x, headY, p.pos.z)) continue
             val hpx = pxOut; val hpy = pyOut; val hpz = pzOut
             val revealedOverride = p.isLocal || p.wallHackTimer > 0f || p.auraExposed
             val allowedDist = if (revealedOverride) 64f else nameplateMaxDist
             if (hpz > allowedDist) continue
 
-            if (!p.isCarriedInSack) {
+            if (!carried) {
                 val speaking = p.speakingLevel > 0.18f
                 val badgeText = "${p.name} • ${p.role.badgeName}"
                 labelPaint.textSize = 26f
@@ -986,13 +1115,14 @@ fun ThreeDGameViewport(
 
                 val statusTag = when {
                     p.stunTimer > 0f -> "STUNNED ${String.format("%.1fs", p.stunTimer)}"
+                    p.slowTimer > 0f -> "SLOWED ${String.format("%.1fs", p.slowTimer)}"
                     p.slipTimer > 0f -> "SLIPPED!"
                     p.blindTimer > 0f -> "BLINDED!"
                     else -> null
                 }
                 if (statusTag != null) {
                     labelPaint.textSize = 24f
-                    labelPaint.color = Color(0xFFFFD166).toArgb()
+                    labelPaint.color = (if (p.slowTimer > 0f && p.stunTimer <= 0f) Color(0xFFD8B4FE) else Color(0xFFFFD166)).toArgb()
                     nativeCanvas.drawText(statusTag, hpx, py - 10f, labelPaint)
                 }
 
@@ -1005,6 +1135,8 @@ fun ThreeDGameViewport(
                             HoldActionType.KIDNAP -> Color(0xFFFF1744)
                             HoldActionType.ESCAPE -> Color(0xFF00E676)
                             HoldActionType.RESCUE -> Color(0xFFFFD166)
+                            HoldActionType.PICKUP_BOU -> Color(0xFFFFD166)
+                            HoldActionType.BOR_ESCAPE -> Color(0xFF00E676)
                             HoldActionType.NONE -> Color.White
                         },
                         startAngle = -90f,
@@ -1105,7 +1237,7 @@ fun ThreeDGameViewport(
             if (chor != null && chor.wallHackTimer > 0f && localPlayer.role.team == Team.WEDDING) {
                 drawEdgeArrow(chor.pos.x, chor.pos.z, "CHOR!", 0xFFFF1744.toInt())
             }
-            if (chorCarrying) {
+            if (chorCarrying || (borCarrying && localPlayer.role == Role.BOR)) {
                 for (i in world.gates.indices) {
                     val g = world.gates[i]
                     val gc = when (g.type) {
@@ -1115,10 +1247,51 @@ fun ThreeDGameViewport(
                     }
                     drawEdgeArrow(g.pos.x, g.pos.z, g.type.shortTag, gc)
                 }
+            } else if (borCarrying && localPlayer.role == Role.BOU_CHOR) {
+                world.players.firstOrNull { it.role == Role.BOR }?.let { b ->
+                    drawEdgeArrow(b.pos.x, b.pos.z, "JAMAI+BOU", 0xFFFF1744.toInt())
+                }
             } else if (localPlayer.role == Role.BOU) {
                 world.tasks.filter { !it.completed }.minByOrNull { it.pos.dist2D(localPlayer.pos) }?.let { t ->
                     drawEdgeArrow(t.pos.x, t.pos.z, t.type.iconTag, 0xFFFFB703.toInt())
                 }
+            }
+
+            // 12. ZERO-GC CINEMATIC OVERLAY (Action Speed Lines, Danger Rim & Warm Evening Vignette)
+            val cxScreen = w * 0.5f
+            val cyScreen = h * 0.5f
+            if (localPlayer.speedBoostTimer > 0f) {
+                val boostStrength = (localPlayer.speedBoostTimer / 0.5f).coerceIn(0.35f, 1f)
+                overlayStrokePaint.strokeWidth = 3.2f
+                val lineCount = if (isHd) 20 else 12
+                val phaseShift = world.elapsedTimeSec * 14f
+                for (li in 0 until lineCount) {
+                    val ang = (li.toFloat() / lineCount) * 6.28318f + (phaseShift % 0.45f)
+                    val ca = cos(ang); val sa = sin(ang)
+                    val innerFrac = 0.38f + ((li * 37) % 10) * 0.014f
+                    val outerFrac = 0.62f
+                    val maxDim = maxOf(w, h)
+                    val r0 = maxDim * innerFrac
+                    val r1 = maxDim * outerFrac
+                    overlayStrokePaint.color = (((boostStrength * 0.42f * 255f).toInt()) shl 24) or 0xFFF3B0
+                    nativeCanvas.drawLine(cxScreen + ca * r0, cyScreen + sa * r0, cxScreen + ca * r1, cyScreen + sa * r1, overlayStrokePaint)
+                }
+            }
+            if (chorCarrying) {
+                val dangerA = ((0.18f + 0.18f * pulse) * 255f).toInt().coerceIn(0, 120)
+                overlayStrokePaint.strokeWidth = 26f
+                overlayStrokePaint.color = (dangerA shl 24) or 0xFF1744
+                nativeCanvas.drawRect(0f, 0f, w, h, overlayStrokePaint)
+            } else if (localPlayer.slowTimer > 0f) {
+                val slowRimA = ((0.22f + 0.14f * pulse) * 255f).toInt().coerceIn(0, 120)
+                overlayStrokePaint.strokeWidth = 24f
+                overlayStrokePaint.color = (slowRimA shl 24) or 0xA855F7
+                nativeCanvas.drawRect(0f, 0f, w, h, overlayStrokePaint)
+            } else {
+                // Subtle warm theatrical border frame
+                overlayStrokePaint.strokeWidth = 18f
+                overlayStrokePaint.color = 0x2414040A
+                nativeCanvas.drawRect(0f, 0f, w, h, overlayStrokePaint)
             }
         }
     }

@@ -165,7 +165,8 @@ class GameEngine(
         ability1Held: Boolean,
         ability2Pressed: Boolean,
         localMicLevel: Float,
-        allowRandomWeatherTransition: Boolean = true
+        allowRandomWeatherTransition: Boolean = true,
+        ability3Pressed: Boolean = false
     ): GameWorldState {
         val clampedDt = dt.coerceIn(0.001f, 0.05f)
         simFrameCount++
@@ -197,6 +198,7 @@ class GameEngine(
         val roleRevealTimer = (world.roleRevealTimer - clampedDt).coerceAtLeast(0f)
 
         var escapedVia: VehicleType? = null
+        var bidayiEscapedVia: VehicleType? = null
 
         fun addCombatText(text: String, pos: Vec3, color: Color) {
             combatTexts.add(
@@ -247,6 +249,7 @@ class GameEngine(
                 swingAnim = (p.swingAnim - clampedDt * 2.8f).coerceAtLeast(0f),
                 kidnapImmunityTimer = (p.kidnapImmunityTimer - clampedDt).coerceAtLeast(0f),
                 speedBoostTimer = (p.speedBoostTimer - clampedDt).coerceAtLeast(0f),
+                slowTimer = (p.slowTimer - clampedDt).coerceAtLeast(0f),
                 ability1Cooldown = (p.ability1Cooldown - clampedDt).coerceAtLeast(0f),
                 ability2Cooldown = (p.ability2Cooldown - clampedDt).coerceAtLeast(0f),
                 speechBubbleTimer = bubbleTimer,
@@ -257,6 +260,7 @@ class GameEngine(
 
         val bouIdx = players.indexOfFirst { it.role == Role.BOU }
         val chorIdx = players.indexOfFirst { it.role == Role.BOU_CHOR }
+        val borIdx = players.indexOfFirst { it.role == Role.BOR }
         if (bouIdx < 0 || chorIdx < 0) return world
 
         // Camera horizontal basis for strictly CAMERA-RELATIVE movement!
@@ -299,6 +303,32 @@ class GameEngine(
                 continue
             }
 
+            if (p.isCarriedByBor) {
+                val bor = if (borIdx >= 0) players[borIdx] else null
+                if (bor == null || !bor.isCarryingBou || bor.isIncapacitated) {
+                    val dropPos = VenueMap.resolveMovement(Vec3(p.pos.x, 0f, p.pos.z))
+                    players[i] = p.copy(isCarriedByBor = false, pos = dropPos)
+                } else {
+                    players[i] = p.copy(
+                        pos = Vec3(bor.pos.x, 1.25f, bor.pos.z),
+                        velX = 0f,
+                        velZ = 0f,
+                        yaw = bor.yaw,
+                        currentSpeed = 0f,
+                        isMoving = false
+                    )
+                    if (p.isLocal && ability1Pressed) {
+                        val hopPos = VenueMap.resolveMovement(
+                            Vec3(bor.pos.x + sin(bor.yaw) * 1.4f, 0f, bor.pos.z + cos(bor.yaw) * 1.4f)
+                        )
+                        players[i] = players[i].copy(isCarriedByBor = false, pos = hopPos)
+                        players[borIdx] = bor.copy(isCarryingBou = false, holdType = HoldActionType.NONE, holdProgress = 0f)
+                        addCombatText("HOPPED DOWN!", hopPos, MarigoldGold)
+                    }
+                    continue
+                }
+            }
+
             if (!p.isLocal && !p.isBot) {
                 // Remote human players are driven directly by network position packets
                 continue
@@ -307,11 +337,18 @@ class GameEngine(
             if (p.isIncapacitated) {
                 val dvx = damp(p.velX, 0f, 12f, clampedDt)
                 val dvz = damp(p.velZ, 0f, 12f, clampedDt)
+                val dropBou = p.role == Role.BOR && p.isCarryingBou
+                if (dropBou) {
+                    val dropPos = VenueMap.resolveMovement(Vec3(p.pos.x + 1.2f, 0f, p.pos.z))
+                    players[bouIdx] = players[bouIdx].copy(isCarriedByBor = false, pos = dropPos, kidnapImmunityTimer = 1.4f)
+                    addCombatText("DROPPED BOU!", dropPos, MarigoldGold)
+                }
                 players[i] = p.copy(
                     velX = dvx,
                     velZ = dvz,
                     isMoving = false,
                     currentSpeed = 0f,
+                    isCarryingBou = if (dropBou) false else p.isCarryingBou,
                     holdType = HoldActionType.NONE,
                     holdProgress = 0f
                 )
@@ -329,7 +366,8 @@ class GameEngine(
                     moveZ = worldMoveZ,
                     triggerAbility1 = ability1Pressed,
                     holdAction = ability1Held,
-                    triggerAbility2 = ability2Pressed
+                    triggerAbility2 = ability2Pressed,
+                    triggerAbility3 = ability3Pressed
                 )
             } else {
                 computeSmartBotInput(i, p, players, tasks, world.gates, clampedDt, outdoorVisFactor)
@@ -338,7 +376,9 @@ class GameEngine(
             val isPlayerOutdoors = !VenueMap.isInsideBuilding(p.pos)
             var maxSpeed = p.role.baseSpeed
             if (p.speedBoostTimer > 0f) maxSpeed *= 1.40f
+            if (p.slowTimer > 0f) maxSpeed *= 0.45f
             if (p.role == Role.BOU_CHOR && p.isCarryingBou) maxSpeed *= 0.93f
+            if (p.role == Role.BOR && p.isCarryingBou) maxSpeed *= 0.90f
             if (p.blindTimer > 0f && p.isBot) maxSpeed *= 0.55f
             // Outdoor weather slows movement on rain-slicked courtyard grass/tarmac or in dense night fog
             if (isPlayerOutdoors) {
@@ -510,8 +550,15 @@ class GameEngine(
                             val nextProg = (prev + clampedDt / 1.3f).coerceAtMost(1f)
                             tickCapturePulse(clampedDt)
                             if (nextProg >= 1f) {
+                                if (bou.isCarriedByBor && borIdx >= 0) {
+                                    players[borIdx] = players[borIdx].copy(
+                                        isCarryingBou = false,
+                                        holdType = HoldActionType.NONE,
+                                        holdProgress = 0f
+                                    )
+                                }
                                 players[i] = updatedCur.copy(isCarryingBou = true, holdType = HoldActionType.NONE, holdProgress = 0f)
-                                players[bouIdx] = bou.copy(isCarriedInSack = true, auraExposed = false, campTimer = 0f)
+                                players[bouIdx] = bou.copy(isCarriedInSack = true, isCarriedByBor = false, auraExposed = false, campTimer = 0f)
                                 screamBeacon = ScreamBeacon(updatedCur.pos, 8.0f)
                                 stats.kidnapsCount++
                                 stats.lastKidnapTimestampSec = newElapsed
@@ -559,6 +606,19 @@ class GameEngine(
                         soundEngine.playChatPop()
                         addCombatText("DOUBLE BANANA!", activeChor.pos, MarigoldGold)
                     }
+
+                    // Ability 3 (Once per entire match): Slow Mama's speed for 5 seconds!
+                    if (input.triggerAbility3 && !players[i].mamaSlowUsed) {
+                        val mamaIdx = players.indexOfFirst { it.role == Role.MAMA }
+                        players[i] = players[i].copy(mamaSlowUsed = true)
+                        if (mamaIdx >= 0) {
+                            players[mamaIdx] = players[mamaIdx].copy(slowTimer = 5.0f)
+                            shockwaves.add(ShockwaveEffect(nextEffectId++, players[mamaIdx].pos))
+                            addCombatText("SLOWED 5s!", players[mamaIdx].pos, Color(0xFFB388FF))
+                        }
+                        soundEngine.playBananaSlip()
+                        setBanner("CHOR CURSED MAMA! 55% SLOWER FOR 5s (1x USED)!", 3.0f)
+                    }
                 }
 
                 Role.BOR -> {
@@ -566,6 +626,7 @@ class GameEngine(
                     val bou = players[bouIdx]
                     val distToChor = cur.pos.dist2D(chor.pos)
                     val distToBou = cur.pos.dist2D(bou.pos)
+                    val nearGate = if (cur.isCarryingBou) world.gates.firstOrNull { cur.pos.dist2D(it.pos) <= it.radius } else null
 
                     if (input.holdAction && chor.isCarryingBou && distToChor <= 3.6f) {
                         val prev = if (cur.holdType == HoldActionType.RESCUE) cur.holdProgress else 0f
@@ -588,6 +649,7 @@ class GameEngine(
                             )
                             players[bouIdx] = players[bouIdx].copy(
                                 isCarriedInSack = false,
+                                isCarriedByBor = false,
                                 pos = freedPos,
                                 kidnapImmunityTimer = 2.5f
                             )
@@ -599,6 +661,30 @@ class GameEngine(
                         } else {
                             players[i] = cur.copy(holdType = HoldActionType.RESCUE, holdProgress = nextProg)
                         }
+                    } else if (cur.isCarryingBou && input.holdAction && nearGate != null) {
+                        // Sit inside vehicle with Bou for 3.0s -> Jamai Wins!
+                        val prev = if (cur.holdType == HoldActionType.BOR_ESCAPE) cur.holdProgress else 0f
+                        val nextProg = (prev + clampedDt / 3.0f).coerceAtMost(1f)
+                        tickCapturePulse(clampedDt)
+                        if (nextProg >= 1f) {
+                            soundEngine.playCngHorn()
+                            bidayiEscapedVia = nearGate.type
+                        }
+                        players[i] = cur.copy(holdType = HoldActionType.BOR_ESCAPE, holdProgress = nextProg)
+                    } else if (!cur.isCarryingBou && !chor.isCarryingBou && !bou.isCarriedInSack && !bou.isCarriedByBor && input.holdAction && distToBou <= 3.8f) {
+                        // Scoop Bou into Jamai's arms (0.8s hold)
+                        val prev = if (cur.holdType == HoldActionType.PICKUP_BOU) cur.holdProgress else 0f
+                        val nextProg = (prev + clampedDt / 0.8f).coerceAtMost(1f)
+                        tickCapturePulse(clampedDt)
+                        if (nextProg >= 1f) {
+                            players[i] = cur.copy(isCarryingBou = true, holdType = HoldActionType.NONE, holdProgress = 0f)
+                            players[bouIdx] = bou.copy(isCarriedByBor = true, isCarriedInSack = false, auraExposed = false, campTimer = 0f)
+                            soundEngine.playTaskComplete()
+                            addCombatText("CARRYING BOU!", cur.pos, BorGold)
+                            setBanner("JAMAI CARRYING BOU! SIT IN ANY VEHICLE FOR 3s TO WIN!", 3.4f)
+                        } else {
+                            players[i] = cur.copy(holdType = HoldActionType.PICKUP_BOU, holdProgress = nextProg)
+                        }
                     } else {
                         players[i] = cur.copy(holdType = HoldActionType.NONE, holdProgress = 0f)
                     }
@@ -606,7 +692,7 @@ class GameEngine(
                     // Ability 2: Jamai Guard / Couple Escort Sprint
                     if (input.triggerAbility2 && players[i].ability2Cooldown <= 0f) {
                         val activeBor = players[i]
-                        if (!bou.isCarriedInSack && distToBou <= 4.8f) {
+                        if (!bou.isCarriedInSack && !bou.isCarriedByBor && distToBou <= 4.8f) {
                             players[i] = activeBor.copy(
                                 speedBoostTimer = 3.5f,
                                 ability2Cooldown = 9.0f,
@@ -622,7 +708,7 @@ class GameEngine(
                             setBanner("JAMAI ESCORTING BOU! SHIELD + COUPLE SPEED BOOST!", 2.6f)
                         } else {
                             players[i] = activeBor.copy(
-                                speedBoostTimer = 2.4f,
+                                speedBoostTimer = 2.6f,
                                 ability2Cooldown = 9.0f,
                                 ability2MaxCooldown = 9.0f
                             )
@@ -705,13 +791,19 @@ class GameEngine(
                 pos = Vec3(postSepChor.pos.x, 1.45f, postSepChor.pos.z),
                 yaw = postSepChor.yaw
             )
+        } else if (players[bouIdx].isCarriedByBor && borIdx >= 0) {
+            val postSepBor = players[borIdx]
+            players[bouIdx] = players[bouIdx].copy(
+                pos = Vec3(postSepBor.pos.x, 1.25f, postSepBor.pos.z),
+                yaw = postSepBor.yaw
+            )
         }
 
         // 3. Bou Multi-Zone Wedding Tasks & Anti-Camp Rule
         val bou = players[bouIdx]
         val borPlayer = players.firstOrNull { it.role == Role.BOR }
         val jamaiAssisting = borPlayer != null && !borPlayer.isIncapacitated && bou.pos.dist2D(borPlayer.pos) <= 4.5f
-        if (!bou.isCarriedInSack) {
+        if (!bou.isCarriedInSack && !bou.isCarriedByBor) {
             var doingTask = false
             for (ti in tasks.indices) {
                 val task = tasks[ti]
@@ -775,9 +867,20 @@ class GameEngine(
             var triggered = false
             for (i in players.indices) {
                 val p = players[i]
-                if (p.role != Role.BOU_CHOR && !p.isCarriedInSack && !p.isIncapacitated) {
+                if (p.role != Role.BOU_CHOR && !p.isCarriedInSack && !p.isCarriedByBor && !p.isIncapacitated) {
                     if (p.pos.dist2D(b.pos) <= 1.25f) {
-                        players[i] = p.copy(slipTimer = 2.2f, holdType = HoldActionType.NONE, holdProgress = 0f)
+                        val droppedByBor = p.role == Role.BOR && p.isCarryingBou
+                        if (droppedByBor) {
+                            val dropPos = VenueMap.resolveMovement(Vec3(p.pos.x + 1.2f, 0f, p.pos.z))
+                            players[bouIdx] = players[bouIdx].copy(isCarriedByBor = false, pos = dropPos, kidnapImmunityTimer = 1.4f)
+                            addCombatText("DROPPED BOU!", dropPos, MarigoldGold)
+                        }
+                        players[i] = p.copy(
+                            slipTimer = 2.2f,
+                            isCarryingBou = if (droppedByBor) false else p.isCarryingBou,
+                            holdType = HoldActionType.NONE,
+                            holdProgress = 0f
+                        )
                         stats.bananaSlips++
                         soundEngine.playBananaSlip()
                         addCombatText("SLIPPED!!", p.pos, MarigoldGold)
@@ -928,7 +1031,12 @@ class GameEngine(
         )
 
         // 9. Match End Conditions
-        if (escapedVia != null) {
+        if (bidayiEscapedVia != null) {
+            val result = buildMatchResult(Team.WEDDING, bidayiEscapedVia, newTimeLeft, players, jamaiBidayiWin = true)
+            val localWon = players.firstOrNull { it.isLocal }?.role?.team == Team.WEDDING
+            if (localWon) soundEngine.playVictoryFanfare() else soundEngine.playDefeatFanfare()
+            onMatchFinished(result)
+        } else if (escapedVia != null) {
             val result = buildMatchResult(Team.THIEF, escapedVia, newTimeLeft, players)
             val localWon = players.firstOrNull { it.isLocal }?.role?.team == Team.THIEF
             if (localWon) soundEngine.playVictoryFanfare() else soundEngine.playDefeatFanfare()
@@ -946,7 +1054,7 @@ class GameEngine(
     /**
      * Smooth circle-to-circle push-apart separation between all active characters (radius = 0.85 units each,
      * min center spacing = 1.70 units) so players and bots can never walk inside or fuse into one another.
-     * Skips Bou while she is actively carried on Chor's shoulder.
+     * Skips Bou while she is actively carried by Chor or Bor.
      */
     private fun resolveCharacterSeparation(players: MutableList<PlayerEntity>) {
         val charRadius = 0.85f
@@ -958,10 +1066,10 @@ class GameEngine(
         repeat(2) {
             for (i in 0 until count) {
                 val pA = players[i]
-                if (pA.isCarriedInSack) continue
+                if (pA.isCarriedInSack || pA.isCarriedByBor) continue
                 for (j in i + 1 until count) {
                     val pB = players[j]
-                    if (pB.isCarriedInSack) continue
+                    if (pB.isCarriedInSack || pB.isCarriedByBor) continue
 
                     val dx = pB.pos.x - pA.pos.x
                     val dz = pB.pos.z - pA.pos.z
@@ -1046,7 +1154,8 @@ class GameEngine(
         val moveZ: Float = 0f,
         val triggerAbility1: Boolean = false,
         val holdAction: Boolean = false,
-        val triggerAbility2: Boolean = false
+        val triggerAbility2: Boolean = false,
+        val triggerAbility3: Boolean = false
     )
 
     private fun computeSmartBotInput(
@@ -1114,6 +1223,8 @@ class GameEngine(
                     .filter { it.role != Role.BOU_CHOR && it.role != Role.BOU && !it.isIncapacitated }
                     .minByOrNull { it.pos.dist2D(bot.pos) }
                 val chaserDist = nearestChaser?.pos?.dist2D(bot.pos) ?: 99f
+                val mama = players.firstOrNull { it.role == Role.MAMA }
+                val slowMamaNow = !bot.mamaSlowUsed && mama != null && !mama.isIncapacitated && mama.pos.dist2D(bot.pos) < 11f
                 val dropBanana = chaserDist < 5.5f && bot.ability2Cooldown <= 0f
                 val distBou = bot.pos.dist2D(bou.pos)
                 val triggerDash = (chaserDist < 6.5f || (distBou > 8f && !bot.isCarryingBou)) && bot.ability1Cooldown <= 0f
@@ -1125,10 +1236,10 @@ class GameEngine(
                     } ?: gates.first()
                     val distGate = bot.pos.dist2D(bestGate.pos)
                     if (distGate <= bestGate.radius - 0.4f) {
-                        PlayerActionInput(0f, 0f, holdAction = true, triggerAbility1 = triggerDash, triggerAbility2 = dropBanana)
+                        PlayerActionInput(0f, 0f, holdAction = true, triggerAbility1 = triggerDash, triggerAbility2 = dropBanana, triggerAbility3 = slowMamaNow)
                     } else {
                         steerToward(bestGate.pos)
-                        PlayerActionInput(scratchSteerX, scratchSteerZ, holdAction = distGate <= bestGate.radius, triggerAbility1 = triggerDash, triggerAbility2 = dropBanana)
+                        PlayerActionInput(scratchSteerX, scratchSteerZ, holdAction = distGate <= bestGate.radius, triggerAbility1 = triggerDash, triggerAbility2 = dropBanana, triggerAbility3 = slowMamaNow)
                     }
                 } else {
                     val bouVisibleInFog = bou.auraExposed || distBou < 24f * visScale
@@ -1139,12 +1250,13 @@ class GameEngine(
                             (bou.pos.z - bot.pos.z) * closeIn,
                             holdAction = true,
                             triggerAbility1 = triggerDash,
-                            triggerAbility2 = dropBanana
+                            triggerAbility2 = dropBanana,
+                            triggerAbility3 = slowMamaNow
                         )
                     } else {
                         val chaseGoal = if (bouVisibleInFog) Vec3(bou.pos.x, 0f, bou.pos.z) else getOrPickWanderTarget(bot)
                         steerToward(chaseGoal)
-                        PlayerActionInput(scratchSteerX, scratchSteerZ, triggerAbility1 = triggerDash, triggerAbility2 = dropBanana)
+                        PlayerActionInput(scratchSteerX, scratchSteerZ, triggerAbility1 = triggerDash, triggerAbility2 = dropBanana, triggerAbility3 = slowMamaNow)
                     }
                 }
             }
@@ -1171,18 +1283,31 @@ class GameEngine(
                             triggerAbility2 = sprintToRescue
                         )
                     }
+                } else if (bot.isCarryingBou) {
+                    // Drive Bou safely to the best escape vehicle away from Chor
+                    val bestGate = gates.maxByOrNull { it.pos.dist2D(chor.pos) - it.pos.dist2D(bot.pos) * 0.65f } ?: gates.first()
+                    val distGate = bot.pos.dist2D(bestGate.pos)
+                    val sprintCar = distGate > 8f && bot.ability2Cooldown <= 0f
+                    if (distGate <= bestGate.radius - 0.4f) {
+                        PlayerActionInput(0f, 0f, holdAction = true, triggerAbility2 = sprintCar)
+                    } else {
+                        steerToward(bestGate.pos)
+                        PlayerActionInput(scratchSteerX, scratchSteerZ, holdAction = distGate <= bestGate.radius, triggerAbility2 = sprintCar)
+                    }
                 } else {
                     val guardNow = distBou <= 4.5f && chorNearBou && bot.ability2Cooldown <= 0f
-                    if (distBou > 4.0f) {
+                    // If Bou is also a Bot and Chor is stunned/far, Bot Jamai attempts Bidayi carry-to-car
+                    val shouldTryCarry = bou.isBot && !bou.isCarriedInSack && !bou.isCarriedByBor && (chor.isIncapacitated || distChor > 16f)
+                    if (shouldTryCarry && distBou <= 3.2f) {
+                        PlayerActionInput(0f, 0f, holdAction = true, triggerAbility2 = guardNow)
+                    } else if (distBou > 4.0f) {
                         steerToward(Vec3(bou.pos.x, 0f, bou.pos.z))
                         val sprintToBou = distBou > 12f && chorNearBou && bot.ability2Cooldown <= 0f
                         PlayerActionInput(scratchSteerX, scratchSteerZ, triggerAbility2 = sprintToBou)
                     } else if (chorNearBou) {
-                        // Escort and guard Bou closely when Chor approaches
                         steerToward(Vec3(bou.pos.x, 0f, bou.pos.z))
                         PlayerActionInput(scratchSteerX * 0.5f, scratchSteerZ * 0.5f, triggerAbility2 = guardNow)
                     } else {
-                        // Patrol gently around Bou while assisting tasks
                         steerToward(getOrPickWanderTarget(bot))
                         PlayerActionInput(scratchSteerX * 0.65f, scratchSteerZ * 0.65f, triggerAbility2 = guardNow)
                     }
@@ -1271,7 +1396,8 @@ class GameEngine(
         winningTeam: Team,
         escapedVia: VehicleType?,
         timeRemaining: Float,
-        players: List<PlayerEntity>
+        players: List<PlayerEntity>,
+        jamaiBidayiWin: Boolean = false
     ): MatchResult {
         val mama = players.firstOrNull { it.role == Role.MAMA }
         val bor = players.firstOrNull { it.role == Role.BOR }
@@ -1283,7 +1409,9 @@ class GameEngine(
             if (mama != null) {
                 add(MvpAward("Best Bamboo Hit", mama.name, Role.MAMA, "${stats.bambooHits} DHISHUM Bonks (${stats.bambooDropSaves} Saves)"))
             }
-            if (bor != null) {
+            if (jamaiBidayiWin && bor != null) {
+                add(MvpAward("Bidayi Hero", bor.name, Role.BOR, "Carried Bou to ${escapedVia?.label ?: "Wedding Car"} in 3s!"))
+            } else if (bor != null) {
                 val rescueText = stats.fastestRescueSec?.let { String.format("%.1fs Fastest", it) } ?: "${stats.rescuesCount} Rescues"
                 add(MvpAward("Fastest Rescue", bor.name, Role.BOR, rescueText))
             }
@@ -1297,11 +1425,15 @@ class GameEngine(
             }
         }
 
-        val headline = if (winningTeam == Team.THIEF) "CHOR ESCAPED WITH BOU!" else "BIYE BARI SAVED!"
-        val subtitle = if (winningTeam == Team.THIEF) {
-            "Zoomed away down Dhaka street in the ${escapedVia?.label ?: "Getaway Vehicle"}!"
-        } else {
-            "The Groom's squad defended all 4 wedding zones until time ran out!"
+        val headline = when {
+            jamaiBidayiWin -> "JAMAI ESCAPED WITH BOU!"
+            winningTeam == Team.THIEF -> "CHOR ESCAPED WITH BOU!"
+            else -> "BIYE BARI SAVED!"
+        }
+        val subtitle = when {
+            jamaiBidayiWin -> "Grand Bidayi! Jamai carried Bou safely into the ${escapedVia?.label ?: "Getaway Vehicle"} for 3s!"
+            winningTeam == Team.THIEF -> "Zoomed away down Dhaka street in the ${escapedVia?.label ?: "Getaway Vehicle"}!"
+            else -> "The Groom's squad defended all 4 wedding zones until time ran out!"
         }
 
         return MatchResult(

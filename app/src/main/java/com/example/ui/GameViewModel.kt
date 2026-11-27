@@ -135,6 +135,7 @@ class GameViewModel(application: Application) : AndroidViewModel(application), P
     @Volatile private var pendingAbility1Press = false
     @Volatile private var ability1Held = false
     @Volatile private var pendingAbility2Press = false
+    @Volatile private var pendingAbility3Press = false
 
     private var gameLoopJob: Job? = null
     private var nextChatId = 1L
@@ -346,7 +347,7 @@ class GameViewModel(application: Application) : AndroidViewModel(application), P
         targetCamYaw = initialWorld.cameraYaw
         targetCamPitch = initialWorld.cameraPitch
         targetCamDistance = initialWorld.cameraDistance
-        pendingAbility1Press = false; ability1Held = false; pendingAbility2Press = false
+        pendingAbility1Press = false; ability1Held = false; pendingAbility2Press = false; pendingAbility3Press = false
 
         latestWorld = initialWorld
         renderFrameTick.longValue = renderFrameTick.longValue + 1L
@@ -395,8 +396,10 @@ class GameViewModel(application: Application) : AndroidViewModel(application), P
                 val mz = (joyZ + keyZ).coerceIn(-1f, 1f)
                 val a1Press = pendingAbility1Press
                 val a2Press = pendingAbility2Press
+                val a3Press = pendingAbility3Press
                 pendingAbility1Press = false
                 pendingAbility2Press = false
+                pendingAbility3Press = false
 
                 val prevWorld = latestWorld
                 val nextWorld = gameEngine.step(
@@ -410,9 +413,22 @@ class GameViewModel(application: Application) : AndroidViewModel(application), P
                     ability1Pressed = a1Press,
                     ability1Held = ability1Held,
                     ability2Pressed = a2Press,
+                    ability3Pressed = a3Press,
                     localMicLevel = st.localMicLevel,
                     allowRandomWeatherTransition = st.isSoloMode || st.isHost
                 )
+
+                // Broadcast one-time Chor Mama-Slow hex to peers when triggered locally
+                if (!st.isSoloMode &&
+                    prevWorld.localPlayer?.mamaSlowUsed == false &&
+                    nextWorld.localPlayer?.mamaSlowUsed == true
+                ) {
+                    val slowJson = JSONObject().apply {
+                        put("type", "mama_slow")
+                        put("senderId", peerController.localPeerId)
+                    }.toString()
+                    peerController.broadcastJson(slowJson)
+                }
 
                 // Direct 60 FPS Canvas draw-only invalidation (zero Compose HUD tree recomposition!)
                 latestWorld = nextWorld
@@ -471,8 +487,10 @@ class GameViewModel(application: Application) : AndroidViewModel(application), P
             put("moving", local.isMoving)
             put("carrying", local.isCarryingBou)
             put("sack", local.isCarriedInSack)
+            put("carriedByBor", local.isCarriedByBor)
             put("boost", local.speedBoostTimer > 0f)
             put("stun", local.stunTimer > 0f)
+            put("slow", local.slowTimer > 0f)
         }.toString()
         peerController.broadcastJson(json)
 
@@ -519,6 +537,10 @@ class GameViewModel(application: Application) : AndroidViewModel(application), P
 
     fun triggerAbility2Press() {
         pendingAbility2Press = true
+    }
+
+    fun triggerAbility3Press() {
+        pendingAbility3Press = true
     }
 
     // Voice & Audio Controls
@@ -802,8 +824,10 @@ class GameViewModel(application: Application) : AndroidViewModel(application), P
                     val moving = obj.optBoolean("moving", true)
                     val carrying = obj.optBoolean("carrying", false)
                     val sack = obj.optBoolean("sack", false)
+                    val carriedByBor = obj.optBoolean("carriedByBor", false)
                     val boost = obj.optBoolean("boost", false)
                     val stun = obj.optBoolean("stun", false)
+                    val slowed = obj.optBoolean("slow", false)
                     latestWorld = latestWorld.copy(
                         players = latestWorld.players.map { p ->
                             if (p.id == senderId) {
@@ -814,11 +838,28 @@ class GameViewModel(application: Application) : AndroidViewModel(application), P
                                     walkPhase = if (moving) p.walkPhase + 0.35f else p.walkPhase,
                                     isCarryingBou = carrying,
                                     isCarriedInSack = sack,
+                                    isCarriedByBor = carriedByBor,
                                     speedBoostTimer = if (boost) 0.3f else 0f,
-                                    stunTimer = if (stun) 0.3f else 0f
+                                    stunTimer = if (stun) 0.3f else 0f,
+                                    slowTimer = if (slowed && p.slowTimer <= 0f) 0.35f else if (!slowed && p.role != Role.MAMA) 0f else p.slowTimer
                                 )
                             } else p
                         }
+                    )
+                }
+
+                "mama_slow" -> {
+                    soundEngine.playBananaSlip()
+                    latestWorld = latestWorld.copy(
+                        players = latestWorld.players.map { p ->
+                            when (p.role) {
+                                Role.MAMA -> p.copy(slowTimer = 5.0f)
+                                Role.BOU_CHOR -> p.copy(mamaSlowUsed = true)
+                                else -> p
+                            }
+                        },
+                        bannerAlertText = "CHOR SLOWED MAMA FOR 5s! (1x)",
+                        bannerAlertTimer = 3.2f
                     )
                 }
 

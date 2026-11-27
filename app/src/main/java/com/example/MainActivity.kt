@@ -132,6 +132,7 @@ fun BouChorApp(viewModel: GameViewModel = viewModel()) {
                     onAbility1Press = viewModel::triggerAbility1Press,
                     onAbility1HoldChanged = viewModel::setAbility1Held,
                     onAbility2Press = viewModel::triggerAbility2Press,
+                    onAbility3Press = viewModel::triggerAbility3Press,
                     onToggleMic = viewModel::toggleMic,
                     onToggleSpeaker = viewModel::toggleSpeakerMute,
                     onToggleTeamRadio = viewModel::toggleTeamRadio,
