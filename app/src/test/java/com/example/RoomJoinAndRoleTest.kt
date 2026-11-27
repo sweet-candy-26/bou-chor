@@ -9,8 +9,11 @@ import com.example.game.MatchResult
 import com.example.game.Role
 import com.example.game.Team
 import com.example.game.Vec3
+import com.example.network.AdpcmState
 import com.example.network.BouChorMqttRelayManager
+import com.example.network.decodeAdpcmFrame
 import com.example.network.decodeMuLawFrame
+import com.example.network.encodeAdpcmFrame
 import com.example.network.encodeMuLawFrame
 import org.json.JSONArray
 import org.json.JSONObject
@@ -468,5 +471,24 @@ class RoomJoinAndRoleTest {
             if (err > maxErr) maxErr = err
         }
         assertTrue("G.711 u-law quantization error ($maxErr) must preserve voice clarity (< 600)", maxErr < 600)
+
+        // Verify 4-bit IMA ADPCM codec roundtrip at 1280 samples (80ms @ 16kHz)
+        val pcm16k = ShortArray(1280) { i ->
+            (kotlin.math.sin(i * 0.14) * 12000.0).toInt().toShort()
+        }
+        val adpcm = ByteArray(4 + pcm16k.size / 2)
+        val state = AdpcmState(pcm16k[0].toInt(), 42)
+        encodeAdpcmFrame(pcm16k, adpcm, state)
+        val decodedAdpcm = decodeAdpcmFrame(adpcm)
+        assertEquals(pcm16k.size, decodedAdpcm.size)
+        var maxAdpcmErr = 0
+        var errSqSum = 0.0
+        for (i in 12 until pcm16k.size) {
+            val err = kotlin.math.abs(pcm16k[i] - decodedAdpcm[i])
+            if (err > maxAdpcmErr) maxAdpcmErr = err
+            errSqSum += err.toDouble() * err.toDouble()
+        }
+        val rmse = kotlin.math.sqrt(errSqSum / (pcm16k.size - 12))
+        assertTrue("IMA ADPCM steady error ($maxAdpcmErr) and RMSE ($rmse) must preserve clear voice", maxAdpcmErr < 900 && rmse < 400.0)
     }
 }

@@ -490,7 +490,7 @@ class GameViewModel(application: Application) : AndroidViewModel(application), P
 
                 // Sync spatial proximity voice, P2P human transforms & Host bots/tasks
                 netBroadcastCounter++
-                if (!st.isSoloMode && netBroadcastCounter % 4 == 0) {
+                if (!st.isSoloMode && netBroadcastCounter % 6 == 0) {
                     syncMultiplayerAndProximityVoice(nextWorld, st.isTeamRadioEnabled, st.isHost)
                 }
 
@@ -524,7 +524,7 @@ class GameViewModel(application: Application) : AndroidViewModel(application), P
         }.toString()
         peerController.broadcastJson(json)
 
-        if (isHost && netBroadcastCounter % 8 == 0) {
+        if (isHost && netBroadcastCounter % 12 == 0) {
             val botsArr = org.json.JSONArray()
             for (p in world.players) {
                 if (p.isBot) {

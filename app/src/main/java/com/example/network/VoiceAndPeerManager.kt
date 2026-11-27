@@ -90,7 +90,7 @@ class NativeMicMonitor(private val context: Context) {
         monitorJob = scope.launch {
             var recorder: AudioRecord? = null
             var activeRate = 16000
-            var frameSamples = 800 // 50ms @ 16kHz (400 @ 8kHz)
+            var frameSamples = 1280 // 80ms @ 16kHz (12.5 packets/sec for jitter-free speech)
             try {
                 // Prefer MIC at 16kHz (widely clear on real phones + MSI App Player/emulators),
                 // then VOICE_COMMUNICATION / 8kHz fallbacks.
@@ -108,7 +108,7 @@ class NativeMicMonitor(private val context: Context) {
                         AudioFormat.ENCODING_PCM_16BIT
                     )
                     if (minBuf <= 0) continue
-                    val targetFrame = if (rate >= 16000) 800 else 400
+                    val targetFrame = if (rate >= 16000) 1280 else 640 // 80ms frame
                     val bufBytes = maxOf(minBuf * 2, targetFrame * 4)
                     val rec = runCatching {
                         AudioRecord(
@@ -137,8 +137,11 @@ class NativeMicMonitor(private val context: Context) {
 
                 val buffer = ShortArray(frameSamples)
                 val boostedBuf = ShortArray(frameSamples)
-                val uLawBytes = ByteArray(frameSamples)
+                val adpcmOut = ByteArray(4 + frameSamples / 2)
                 var hangoverFrames = 0
+                var smoothedGain = 2.4f
+                var inBurst = false
+                val adpcmState = AdpcmState()
                 while (isActive) {
                     var offset = 0
                     while (offset < frameSamples && isActive) {
@@ -163,21 +166,33 @@ class NativeMicMonitor(private val context: Context) {
 
                         val callback = onEncodedVoiceFrame
                         if (callback != null && offset == frameSamples) {
-                            // Sensitive speech detection so soft speakers / emulator mics never drop words
+                            // Sensitive speech detection with 560ms tail hold
                             if (rms > 0.0022f || peakNorm > 0.014f) {
-                                hangoverFrames = 10 // 500ms tail hold
+                                hangoverFrames = 7 // 7 * 80ms = 560ms
                             }
                             if (hangoverFrames > 0) {
                                 hangoverFrames--
-                                // Clean software AGC boost so friend's speaker plays loud & clear
-                                val maxSafeGain = if (peakNorm > 0.02f) (0.85f / peakNorm).coerceAtMost(7.0f) else 6.0f
-                                val desiredGain = (0.20f / rms.coerceAtLeast(0.004f)).coerceIn(2.0f, maxSafeGain)
+                                // Smooth continuous AGC so gain never pumps/clicks between frames
+                                val maxSafeGain = if (peakNorm > 0.02f) (0.82f / peakNorm).coerceAtMost(5.5f) else 5.0f
+                                val targetGain = (0.18f / rms.coerceAtLeast(0.004f)).coerceIn(1.8f, maxSafeGain)
+                                smoothedGain = smoothedGain * 0.85f + targetGain * 0.15f
                                 for (i in 0 until frameSamples) {
-                                    boostedBuf[i] = (buffer[i] * desiredGain).toInt().coerceIn(-32767, 32767).toShort()
+                                    boostedBuf[i] = (buffer[i] * smoothedGain).toInt().coerceIn(-32767, 32767).toShort()
                                 }
-                                encodeMuLawFrame(boostedBuf, uLawBytes)
-                                val b64 = Base64.encodeToString(uLawBytes, Base64.NO_WRAP)
+                                if (!inBurst) {
+                                    inBurst = true
+                                    adpcmState.reset(boostedBuf[0].toInt())
+                                    // Gentle 32-sample (2ms) fade-in to avoid click at speech onset
+                                    val ramp = minOf(32, frameSamples)
+                                    for (i in 0 until ramp) {
+                                        boostedBuf[i] = ((boostedBuf[i].toInt() * i) / ramp).toShort()
+                                    }
+                                }
+                                encodeAdpcmFrame(boostedBuf, adpcmOut, adpcmState)
+                                val b64 = Base64.encodeToString(adpcmOut, Base64.NO_WRAP)
                                 callback(b64, activeRate)
+                            } else if (inBurst) {
+                                inBurst = false
                             }
                         }
                     } else {
@@ -201,6 +216,112 @@ class NativeMicMonitor(private val context: Context) {
         _micLevel.value = 0f
         _isMicActive.value = false
     }
+}
+
+internal class AdpcmState(var predictor: Int = 0, var stepIndex: Int = 24) {
+    fun reset(initPredictor: Int = 0) {
+        predictor = initPredictor.coerceIn(-32768, 32767)
+        stepIndex = 24
+    }
+}
+
+private val IMA_INDEX_TABLE = intArrayOf(
+    -1, -1, -1, -1, 2, 4, 6, 8,
+    -1, -1, -1, -1, 2, 4, 6, 8
+)
+
+private val IMA_STEP_TABLE = intArrayOf(
+    7, 8, 9, 10, 11, 12, 13, 14, 16, 17,
+    19, 21, 23, 25, 28, 31, 34, 37, 41, 45,
+    50, 55, 60, 66, 73, 80, 88, 97, 107, 118,
+    130, 143, 157, 173, 190, 209, 230, 253, 279, 307,
+    337, 371, 408, 449, 494, 544, 598, 658, 724, 796,
+    876, 963, 1060, 1166, 1282, 1411, 1552, 1707, 1878, 2066,
+    2272, 2499, 2749, 3024, 3327, 3660, 4026, 4428, 4871, 5358,
+    5894, 6484, 7132, 7845, 8630, 9493, 10442, 11487, 12635, 13899,
+    15289, 16818, 18500, 20350, 22385, 24623, 27086, 29794, 32767
+)
+
+internal fun encodeAdpcmFrame(pcm: ShortArray, out: ByteArray, state: AdpcmState = AdpcmState()) {
+    val startPred = state.predictor.coerceIn(-32768, 32767)
+    val startIdx = state.stepIndex.coerceIn(0, 88)
+    out[0] = (startPred and 0xFF).toByte()
+    out[1] = ((startPred shr 8) and 0xFF).toByte()
+    out[2] = startIdx.toByte()
+    out[3] = 0
+
+    var pred = startPred
+    var idx = startIdx
+    var bytePos = 4
+    var i = 0
+    while (i + 1 < pcm.size && bytePos < out.size) {
+        // Sample 0 (low nibble)
+        var step = IMA_STEP_TABLE[idx]
+        var diff = pcm[i].toInt() - pred
+        var n0 = 0
+        if (diff < 0) { n0 = 8; diff = -diff }
+        var delta = step shr 3
+        if (diff >= step) { n0 = n0 or 4; diff -= step; delta += step }
+        step = step shr 1
+        if (diff >= step) { n0 = n0 or 2; diff -= step; delta += step }
+        step = step shr 1
+        if (diff >= step) { n0 = n0 or 1; delta += step }
+        pred = (if ((n0 and 8) != 0) pred - delta else pred + delta).coerceIn(-32768, 32767)
+        idx = (idx + IMA_INDEX_TABLE[n0]).coerceIn(0, 88)
+
+        // Sample 1 (high nibble)
+        step = IMA_STEP_TABLE[idx]
+        diff = pcm[i + 1].toInt() - pred
+        var n1 = 0
+        if (diff < 0) { n1 = 8; diff = -diff }
+        delta = step shr 3
+        if (diff >= step) { n1 = n1 or 4; diff -= step; delta += step }
+        step = step shr 1
+        if (diff >= step) { n1 = n1 or 2; diff -= step; delta += step }
+        step = step shr 1
+        if (diff >= step) { n1 = n1 or 1; delta += step }
+        pred = (if ((n1 and 8) != 0) pred - delta else pred + delta).coerceIn(-32768, 32767)
+        idx = (idx + IMA_INDEX_TABLE[n1]).coerceIn(0, 88)
+
+        out[bytePos++] = ((n0 and 0x0F) or ((n1 and 0x0F) shl 4)).toByte()
+        i += 2
+    }
+    state.predictor = pred
+    state.stepIndex = idx
+}
+
+internal fun decodeAdpcmFrame(data: ByteArray): ShortArray {
+    if (data.size <= 4) return ShortArray(0)
+    val predLo = data[0].toInt() and 0xFF
+    val predHi = data[1].toInt() shl 8
+    var pred = (predHi or predLo).toShort().toInt()
+    var idx = (data[2].toInt() and 0xFF).coerceIn(0, 88)
+
+    val out = ShortArray((data.size - 4) * 2)
+    var outPos = 0
+    for (p in 4 until data.size) {
+        val packed = data[p].toInt() and 0xFF
+        val n0 = packed and 0x0F
+        val step0 = IMA_STEP_TABLE[idx]
+        var d0 = step0 shr 3
+        if ((n0 and 4) != 0) d0 += step0
+        if ((n0 and 2) != 0) d0 += step0 shr 1
+        if ((n0 and 1) != 0) d0 += step0 shr 2
+        pred = (if ((n0 and 8) != 0) pred - d0 else pred + d0).coerceIn(-32768, 32767)
+        idx = (idx + IMA_INDEX_TABLE[n0]).coerceIn(0, 88)
+        out[outPos++] = pred.toShort()
+
+        val n1 = (packed shr 4) and 0x0F
+        val step1 = IMA_STEP_TABLE[idx]
+        var d1 = step1 shr 3
+        if ((n1 and 4) != 0) d1 += step1
+        if ((n1 and 2) != 0) d1 += step1 shr 1
+        if ((n1 and 1) != 0) d1 += step1 shr 2
+        pred = (if ((n1 and 8) != 0) pred - d1 else pred + d1).coerceIn(-32768, 32767)
+        idx = (idx + IMA_INDEX_TABLE[n1]).coerceIn(0, 88)
+        out[outPos++] = pred.toShort()
+    }
+    return out
 }
 
 internal fun encodeMuLawFrame(pcm: ShortArray, out: ByteArray) {
@@ -583,12 +704,18 @@ class BouChorLanManager(
         }
     }
 
+    fun hasConnectedPeers(): Boolean {
+        return if (isHosting) hostClientSockets.isNotEmpty() else (clientSocket?.isConnected == true && clientSocket?.isClosed == false)
+    }
+
     private fun sendToSocket(s: Socket, data: String): Boolean {
         return try {
             synchronized(s) {
                 if (s.isConnected && !s.isClosed) {
-                    val out = PrintWriter(OutputStreamWriter(s.getOutputStream()), true)
-                    out.println(data)
+                    val bytes = (data + "\n").toByteArray(Charsets.UTF_8)
+                    val out = s.getOutputStream()
+                    out.write(bytes)
+                    out.flush()
                     true
                 } else {
                     false
@@ -685,8 +812,10 @@ class PeerBridgeController(
 
     private data class RemoteVoiceChunk(
         val senderId: String,
-        val base64MuLaw: String,
-        val sampleRate: Int
+        val base64Data: String,
+        val sampleRate: Int,
+        val codec: String = "a",
+        val isFlush: Boolean = false
     )
 
     private val voiceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -696,6 +825,10 @@ class PeerBridgeController(
     private val remotePeerGains = Collections.synchronizedMap(mutableMapOf<String, Float>())
     private val remoteAudioTracks = Collections.synchronizedMap(mutableMapOf<String, AudioTrack>())
     private val remoteTrackRates = Collections.synchronizedMap(mutableMapOf<String, Int>())
+    private val pendingJitterBuf = mutableMapOf<String, MutableList<ShortArray>>()
+    private val lastVoiceWriteMs = mutableMapOf<String, Long>()
+    @Volatile
+    private var hasOpenWebRtcPeer = false
     private var voiceSeq = 1L
 
     init {
@@ -793,7 +926,7 @@ class PeerBridgeController(
         evalJs("window.BouChorNet && window.BouChorNet.broadcast($quoted);")
     }
 
-    fun broadcastVoiceFrame(base64MuLaw: String, sampleRate: Int = 16000) {
+    fun broadcastVoiceFrame(base64Data: String, sampleRate: Int = 16000) {
         if (!nativeMicEnabled || activeRoomCode.isEmpty()) return
         val pkt = JSONObject().apply {
             put("type", "v")
@@ -801,12 +934,15 @@ class PeerBridgeController(
             put("roomCode", activeRoomCode)
             put("pktId", "${localPeerId}_v_${voiceSeq++}")
             put("sr", sampleRate)
-            put("d", base64MuLaw)
+            put("c", "a")
+            put("d", base64Data)
         }.toString()
         lanManager.broadcast(pkt)
         relayManager.publish(pkt)
-        val quoted = JSONObject.quote(pkt)
-        evalJs("window.BouChorNet && window.BouChorNet.broadcast($quoted);")
+        if (hasOpenWebRtcPeer) {
+            val quoted = JSONObject.quote(pkt)
+            evalJs("window.BouChorNet && window.BouChorNet.broadcast($quoted);")
+        }
     }
 
     fun setAudioControls(micOn: Boolean, speakerMuted: Boolean) {
@@ -825,14 +961,19 @@ class PeerBridgeController(
     private fun releaseRemoteTrack(peerId: String) {
         remotePeerGains.remove(peerId)
         remoteTrackRates.remove(peerId)
+        pendingJitterBuf.remove(peerId)
+        lastVoiceWriteMs.remove(peerId)
         val tr = remoteAudioTracks.remove(peerId) ?: return
         runCatching { tr.stop() }
         runCatching { tr.release() }
     }
 
     private fun releaseAllRemoteTracks() {
+        hasOpenWebRtcPeer = false
         remotePeerGains.clear()
         remoteTrackRates.clear()
+        pendingJitterBuf.clear()
+        lastVoiceWriteMs.clear()
         val snapshot = synchronized(remoteAudioTracks) {
             val list = remoteAudioTracks.values.toList()
             remoteAudioTracks.clear()
@@ -844,16 +985,33 @@ class PeerBridgeController(
         }
     }
 
-    private fun handleIncomingVoiceFrame(senderId: String, base64MuLaw: String, sampleRate: Int) {
-        if (base64MuLaw.isEmpty()) return
-        voiceChannel.trySend(RemoteVoiceChunk(senderId, base64MuLaw, if (sampleRate == 8000) 8000 else 16000))
+    private fun handleIncomingVoiceFrame(senderId: String, base64Data: String, sampleRate: Int, codec: String) {
+        if (base64Data.isEmpty()) return
+        voiceChannel.trySend(
+            RemoteVoiceChunk(
+                senderId = senderId,
+                base64Data = base64Data,
+                sampleRate = if (sampleRate == 8000) 8000 else 16000,
+                codec = codec
+            )
+        )
     }
 
     private fun processVoiceChunkOrdered(chunk: RemoteVoiceChunk) {
         try {
-            val uLaw = Base64.decode(chunk.base64MuLaw, Base64.DEFAULT)
-            if (uLaw.isEmpty()) return
-            val pcm = decodeMuLawFrame(uLaw)
+            if (chunk.isFlush) {
+                val queued = pendingJitterBuf.remove(chunk.senderId) ?: return
+                if (queued.isNotEmpty()) {
+                    writePcmFramesToTrack(chunk.senderId, chunk.sampleRate, queued)
+                }
+                return
+            }
+
+            val rawBytes = Base64.decode(chunk.base64Data, Base64.DEFAULT)
+            if (rawBytes.isEmpty()) return
+            val pcm = if (chunk.codec == "a") decodeAdpcmFrame(rawBytes) else decodeMuLawFrame(rawBytes)
+            if (pcm.isEmpty()) return
+
             var sumSq = 0.0
             for (i in pcm.indices) {
                 val n = pcm[i] / 32768.0
@@ -864,37 +1022,66 @@ class PeerBridgeController(
             listener.onRemoteVoiceLevel(chunk.senderId, level)
 
             val effectiveGain = if (nativeSpeakerMuted) 0f else (remotePeerGains[chunk.senderId] ?: 1f)
-            if (effectiveGain <= 0.01f) return
-
-            for (i in pcm.indices) {
-                val scaled = (pcm[i] * effectiveGain).toInt().coerceIn(-32768, 32767)
-                pcm[i] = scaled.toShort()
+            if (effectiveGain <= 0.01f) {
+                pendingJitterBuf.remove(chunk.senderId)
+                return
             }
 
-            val existingRate = remoteTrackRates[chunk.senderId]
-            if (existingRate != null && existingRate != chunk.sampleRate) {
-                remoteAudioTracks.remove(chunk.senderId)?.let { oldTr ->
-                    runCatching { oldTr.stop() }
-                    runCatching { oldTr.release() }
+            if (effectiveGain < 0.99f) {
+                for (i in pcm.indices) {
+                    val scaled = (pcm[i] * effectiveGain).toInt().coerceIn(-32768, 32767)
+                    pcm[i] = scaled.toShort()
                 }
             }
 
-            val track = remoteAudioTracks[chunk.senderId] ?: synchronized(remoteAudioTracks) {
-                remoteAudioTracks[chunk.senderId] ?: createVoiceAudioTrack(chunk.sampleRate)?.also {
-                    remoteAudioTracks[chunk.senderId] = it
-                    remoteTrackRates[chunk.senderId] = chunk.sampleRate
+            val nowMs = System.currentTimeMillis()
+            val lastMs = lastVoiceWriteMs[chunk.senderId] ?: 0L
+            val existingQueue = pendingJitterBuf[chunk.senderId]
+            if (existingQueue != null) {
+                existingQueue.add(pcm)
+                if (existingQueue.size >= 2) {
+                    pendingJitterBuf.remove(chunk.senderId)
+                    writePcmFramesToTrack(chunk.senderId, chunk.sampleRate, existingQueue)
                 }
-            } ?: return
-
-            if (track.playState != AudioTrack.PLAYSTATE_PLAYING) {
-                runCatching {
-                    track.setVolume(AudioTrack.getMaxVolume())
-                    track.play()
+            } else if (nowMs - lastMs > 380L) {
+                // Start of new speech burst: buffer 2 frames (160ms) cleanly so EMQX/Wi-Fi jitter never causes stutters
+                pendingJitterBuf[chunk.senderId] = mutableListOf(pcm)
+                voiceScope.launch {
+                    delay(150)
+                    voiceChannel.trySend(RemoteVoiceChunk(chunk.senderId, "", chunk.sampleRate, "flush", isFlush = true))
                 }
+            } else {
+                writePcmFramesToTrack(chunk.senderId, chunk.sampleRate, listOf(pcm))
             }
-            track.write(pcm, 0, pcm.size)
         } catch (_: Throwable) {
         }
+    }
+
+    private fun writePcmFramesToTrack(senderId: String, sampleRate: Int, frames: List<ShortArray>) {
+        val existingRate = remoteTrackRates[senderId]
+        if (existingRate != null && existingRate != sampleRate) {
+            remoteAudioTracks.remove(senderId)?.let { oldTr ->
+                runCatching { oldTr.stop() }
+                runCatching { oldTr.release() }
+            }
+        }
+        val track = remoteAudioTracks[senderId] ?: synchronized(remoteAudioTracks) {
+            remoteAudioTracks[senderId] ?: createVoiceAudioTrack(sampleRate)?.also {
+                remoteAudioTracks[senderId] = it
+                remoteTrackRates[senderId] = sampleRate
+            }
+        } ?: return
+
+        if (track.playState != AudioTrack.PLAYSTATE_PLAYING) {
+            runCatching {
+                track.setVolume(AudioTrack.getMaxVolume())
+                track.play()
+            }
+        }
+        for (pcm in frames) {
+            track.write(pcm, 0, pcm.size)
+        }
+        lastVoiceWriteMs[senderId] = System.currentTimeMillis()
     }
 
     private fun createVoiceAudioTrack(sampleRate: Int): AudioTrack? {
@@ -905,7 +1092,8 @@ class PeerBridgeController(
                 AudioFormat.ENCODING_PCM_16BIT
             )
             if (minBuf <= 0) return null
-            val targetBuf = maxOf(minBuf, (sampleRate / 10) * 2) // 100ms fast zero-stall playout buffer
+            // 500ms ring buffer absorbs internet/MQTT burst jitter smoothly without stutters
+            val targetBuf = maxOf(minBuf * 2, sampleRate)
             AudioTrack.Builder()
                 .setAudioAttributes(
                     AudioAttributes.Builder()
@@ -968,7 +1156,7 @@ class PeerBridgeController(
             synchronized(seenPacketIds) {
                 if (seenPacketIds.contains(pktId)) return
                 seenPacketIds.add(pktId)
-                if (seenPacketIds.size > 256) {
+                if (seenPacketIds.size > 512) {
                     val iter = seenPacketIds.iterator()
                     if (iter.hasNext()) {
                         iter.next()
@@ -1015,7 +1203,12 @@ class PeerBridgeController(
             }
 
             "v" -> {
-                handleIncomingVoiceFrame(senderId, obj.optString("d", ""), obj.optInt("sr", 16000))
+                handleIncomingVoiceFrame(
+                    senderId = senderId,
+                    base64Data = obj.optString("d", ""),
+                    sampleRate = obj.optInt("sr", 16000),
+                    codec = obj.optString("c", "u")
+                )
             }
 
             "bye" -> {
@@ -1051,6 +1244,7 @@ class PeerBridgeController(
 
         @JavascriptInterface
         fun onPeerJoined(peerId: String, name: String) {
+            hasOpenWebRtcPeer = true
             val wrapped = JSONObject().apply {
                 put("type", "hello")
                 put("senderId", peerId)
@@ -1068,6 +1262,7 @@ class PeerBridgeController(
 
         @JavascriptInterface
         fun onPacket(peerId: String, payload: String) {
+            hasOpenWebRtcPeer = true
             handleUnifiedPacket(peerId, payload)
         }
 
